@@ -1,86 +1,78 @@
 const axios = require("axios");
-const Validator = require('../utils/validator');
-const Helpers = require('../utils/helpers');
+const path = require('path');
 
 const gitRepoRegex = /(?:https?:\/\/)?(?:www\.)?github\.com\/([^\s/]+)\/([^\s/]+)(?:\.git)?/i;
 
 module.exports = {
     name: 'gitclone',
-    description: 'Download GitHub repository as zip file',
-    aliases: ['gitdl', 'github', 'git', 'repodl', 'clone'],
+    description: 'Download GitHub repo as zip with buttons',
+    aliases: ['gitdl', 'github', 'git'],
     category: 'downloader',
-    cooldown: 10000,
 
     async execute(context) {
+        const { sock, chatId, args, sendMessage } = context;
+        const githubUrl = args[0];
+
+        if (!githubUrl || !gitRepoRegex.test(githubUrl)) {
+            return sendMessage("❌ Tafadhali weka link sahihi ya GitHub repo!\n\n*Usage:* .gitclone https://github.com/user/repo");
+        }
+
         try {
-            const { message: { text }, sendMessage } = context;
-            const githubUrl = text?.trim() || '';
-
-            if (!githubUrl) {
-                return sendMessage(
-                    `❌ Please provide a GitHub repository link.\n\n*Usage:* .gitclone https://github.com/user/repo`
-                );
-            }
-
-            // Validate GitHub URL
-            Validator.githubUrl(githubUrl);
-
-            if (!gitRepoRegex.test(githubUrl)) {
-                return sendMessage(
-                    "❌ Invalid GitHub link format. Please provide a valid repository URL."
-                );
-            }
-
-            let [, user, repo] = githubUrl.match(gitRepoRegex) || [];
-            repo = repo.replace(/\.git$/, "").split("/")[0];
+            let [, user, repo] = githubUrl.match(gitRepoRegex);
+            repo = repo.replace(/\.git$/, "");
 
             const apiUrl = `https://api.github.com/repos/${user}/${repo}`;
-            const zipUrl = `https://github.com/${user}/${repo}/archive/refs/heads/main.zip`;
+            
+            // Pata maelezo ya repo toka GitHub API
+            const { data } = await axios.get(apiUrl);
+            
+            const repoInfo = `📦 *GIT REPO INFO* 📦\n\n` +
+                `👤 *Owner:* ${data.owner.login}\n` +
+                `📂 *Repo:* ${data.name}\n` +
+                `📝 *Desc:* ${data.description || 'No description available'}\n` +
+                `⭐ *Stars:* ${data.stargazers_count}\n` +
+                `🍴 *Forks:* ${data.forks_count}\n` +
+                `🎈 *Lang:* ${data.language || 'Multi'}\n\n` +
+                `_Bofya kitufe cha pili kupata file la ZIP_`;
 
-            await sendMessage(`⏳ Fetching repository *${user}/${repo}*...`);
+            const zipUrl = `https://github.com/${user}/${repo}/archive/refs/heads/${data.default_branch}.zip`;
 
-            const repoResponse = await axios.get(apiUrl, { timeout: 10000 });
-            if (!repoResponse.data) {
-                return sendMessage(
-                    "❌ Repository not found or access denied. Ensure it's public."
-                );
-            }
+            // Kutuma ujumbe wenye picha na Maelezo (Ad Reply Style)
+            await sock.sendMessage(chatId, {
+                text: repoInfo,
+                contextInfo: {
+                    externalAdReply: {
+                        title: `Mickey Glitch Git Downloader`,
+                        body: `Repository: ${data.full_name}`,
+                        thumbnailUrl: data.owner.avatar_url,
+                        sourceUrl: githubUrl,
+                        mediaType: 1,
+                        renderLargerThumbnail: true
+                    }
+                }
+            });
 
-            const repoData = repoResponse.data;
-            const defaultBranch = repoData.default_branch || "main";
-            const description = repoData.description || "GitHub Repository";
-            const starsCount = repoData.stargazers_count || 0;
-            const forksCount = repoData.forks_count || 0;
-            const language = repoData.language || "Not specified";
-            const size = Helpers.formatBytes(repoData.size * 1024);
+            // Kutuma File la ZIP moja kwa moja (Download action)
+            // Hapa tuna-simulate button ya pili "Download Zip"
+            await sendMessage(`⏳ Inatayarisha file la ZIP kwa ajili ya *${repo}*...`);
+            
+            await sock.sendMessage(chatId, { 
+                document: { url: zipUrl }, 
+                fileName: `${repo}.zip`, 
+                mimetype: 'application/zip',
+                caption: `✅ Hili hapa file la ZIP la repo: *${repo}*`
+            }, { quoted: context.msg });
 
-            let resultMessage = `📦 *GitHub Repository*\n\n`;
-            resultMessage += `*Repo:* _${user}/${repo}_\n`;
-            resultMessage += `*Branch:* ${defaultBranch}\n`;
-            resultMessage += `*Language:* ${language}\n`;
-            resultMessage += `*Size:* ${size}\n`;
-            resultMessage += `*Stars:* ⭐ ${starsCount} | *Forks:* 🔀 ${forksCount}\n`;
-            resultMessage += `*Description:* ${Helpers.truncate(description, 100)}\n\n`;
-            resultMessage += `*Download:* [ZIP](${zipUrl})`;
+            // Button Info (Maelezo ya Links)
+            const btnInfo = `🔗 *QUICK LINKS* 🔗\n\n` +
+                `1️⃣ *Visit Repo:* ${githubUrl}\n` +
+                `2️⃣ *Support Channel:* https://whatsapp.com/channel/0029Vb6B9xFCxoAseuG1g610`;
+            
+            await sendMessage(btnInfo);
 
-            await sendMessage(resultMessage);
         } catch (error) {
-            console.error("GitClone error:", error);
-
-            if (error.message?.includes("Invalid") || error.message?.includes("Must be")) {
-                return await context.sendMessage(error.message);
-            } else if (error.message?.includes("404")) {
-                return await context.sendMessage("❌ Repository not found.");
-            } else if (error.message?.includes("rate limit")) {
-                return await context.sendMessage(
-                    "❌ API rate limit exceeded. Try again later."
-                );
-            } else {
-                return await context.sendMessage(
-                    Helpers.createErrorMessage('Download Error', 'Failed to fetch repository', 
-                        Helpers.truncate(error.message, 80))
-                );
-            }
+            console.error("Git error:", error);
+            await sendMessage(`❌ Hitilafu imetokea: ${error.message}`);
         }
     }
 };
