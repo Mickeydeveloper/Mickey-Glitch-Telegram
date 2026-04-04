@@ -319,6 +319,14 @@ const runCommand = async (context, text) => {
     const commandData = parseCommand(text);
     if (!commandData) return false;
 
+    // Check if command is being run in private chat
+    const isPrivateChat = context.type === 'telegram' ? context.chatType === 'private' : context.chatId?.endsWith('@s.whatsapp.net');
+    
+    if (!isPrivateChat) {
+        await context.sendMessage('❌ Commands only work in private chats');
+        return true;
+    }
+
     const { commandName, args } = commandData;
 
     const commandContext = {
@@ -925,6 +933,7 @@ bot.on('message', async (ctx) => {
         type: 'telegram',
         userId,
         userNickname,
+        chatType: ctx.message.chat.type,
         message: { text: message, timestamp: Date.now() },
         isOwner: global.isOwner,
         isDeveloper: global.isDeveloper,
@@ -1107,6 +1116,7 @@ async function startWhatsApp() {
                 type: 'whatsapp',
                 userId,
                 chatId,
+                isGroupChat: chatId?.endsWith('@g.us'),
                 userNickname: message.pushName || (message.key.participant || message.key.remoteJid),
                 message: { text: messageText, ...message },
                 isOwner: global.isOwner,

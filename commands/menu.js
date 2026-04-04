@@ -1,82 +1,110 @@
 const moment = require('moment-timezone');
 const fs = require('fs');
 const path = require('path');
+const Helpers = require('../utils/helpers');
 
 /**
- * Mfumo wa kusoma commands automatic kutoka kwenye folder
+ * Read commands from folder automatically
  */
 function getCommandsInfo() {
     try {
         const commandsPath = path.join(__dirname, '../commands'); 
         const files = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
         const commandList = [];
+        const uniqueNames = new Set();
+
         files.forEach(file => {
             try {
                 const cmd = require(path.join(commandsPath, file));
-                commandList.push({
-                    name: cmd.name || file.replace('.js', ''),
-                    category: cmd.category || '📂 NYINGINEZO'
-                });
-            } catch (e) {}
+                if (cmd.name && !uniqueNames.has(cmd.name)) {
+                    uniqueNames.add(cmd.name);
+                    commandList.push({
+                        name: cmd.name,
+                        category: cmd.category || '📂 OTHERS',
+                        description: cmd.description || 'No description',
+                        aliases: cmd.aliases || []
+                    });
+                }
+            } catch (e) {
+                // Silently skip errors
+            }
         });
+
         return commandList;
-    } catch (e) { return []; }
+    } catch (e) { 
+        return []; 
+    }
 }
 
 module.exports = {
     name: 'menu',
-    description: 'Main menu with Interactive Buttons',
-    aliases: ['help', 'h', 'msaada'],
+    description: 'Main menu with command list',
+    aliases: ['help', 'h', 'commands', 'cmd'],
     category: 'utilities',
+    cooldown: 10000,
 
     async execute(context) {
-        const { zephy, chatId, message, pushName } = context;
-        // Tunahitaji generateWAMessageFromContent na proto kutoka Baileys
-        const { generateWAMessageFromContent, proto } = require('@whiskeysockets/baileys');
-
         try {
-            const botName = 'MICKEY GLITCH';
-            const timeStr = moment().tz('Africa/Dar_es_Salaam').format('HH:mm:ss');
-            const dateStr = moment().tz('Africa/Dar_es_Salaam').format('ddd, MMM D');
+            const { sendMessage, userNickname, type } = context;
+
+            const botName = 'MICKEY GLITCH BOT';
+            const botVersion = '5.0.0';
+            const currentTime = Helpers.getCurrentTime();
             
             const allCmds = getCommandsInfo();
             const categorized = {};
+
+            // Categorize commands
             allCmds.forEach(cmd => {
-                if (!categorized[cmd.category]) categorized[cmd.category] = [];
-                categorized[cmd.category].push(cmd.name);
+                if (!categorized[cmd.category]) {
+                    categorized[cmd.category] = [];
+                }
+                categorized[cmd.category].push(cmd);
             });
 
-            // --- JENGA TEXT YA MENU ---
-            let menuBody = `✨ *${botName} V3.0* ✨\n\n`;
-            menuBody += `┌  👋 *Habari:* ${pushName}\n`;
-            menuBody += `│  🕒 *Muda:* ${timeStr} EAT\n`;
-            menuBody += `│  📅 *Tarehe:* ${dateStr}\n`;
-            menuBody += `│  📦 *Amri:* ${allCmds.length} Total\n`;
-            menuBody += `└────────────────────┘\n\n`;
+            // Build menu text
+            let menuBody = `✨ *${botName} V${botVersion}* ✨\n\n`;
+            menuBody += `┌─────────────────────┐\n`;
+            menuBody += `│ 👋 *User:* ${Helpers.truncate(userNickname, 15)}\n`;
+            menuBody += `│ 🕒 *Time:* ${currentTime}\n`;
+            menuBody += `│ 📦 *Commands:* ${allCmds.length}\n`;
+            menuBody += `│ 📱 *Platform:* ${type === 'telegram' ? 'Telegram' : 'WhatsApp'}\n`;
+            menuBody += `└─────────────────────┘\n\n`;
+            
+            menuBody += `*━━━━ AVAILABLE COMMANDS ━━━━*\n\n`;
 
-            Object.entries(categorized).forEach(([cat, cmds]) => {
-                menuBody += `*╭───「 ${cat.toUpperCase()} 」*\n`;
-                menuBody += `│ • ` + cmds.map(n => `\`.${n}\``).join('\n│ • ') + `\n`;
-                menuBody += `*╰───────────────💎*\n\n`;
+            Object.entries(categorized).forEach(([category, commands]) => {
+                menuBody += `*╭─ ${category}*\n`;
+                commands.forEach((cmd, index) => {
+                    const isLast = index === commands.length - 1;
+                    const prefix = isLast ? '╰' : '├';
+                    const cmdDisplay = `.${cmd.name}`;
+                    const aliasText = cmd.aliases && cmd.aliases.length > 0 
+                        ? ` (${cmd.aliases.join(', ')})` 
+                        : '';
+                    menuBody += `${prefix}─ \`${cmdDisplay}\`${aliasText}\n`;
+                    if (!isLast) {
+                        menuBody += `│  ${cmd.description}\n`;
+                    }
+                });
+                menuBody += `*╰──────────────────*\n\n`;
             });
 
-            const buttons = [
-                { buttonId: '.alive', buttonText: { displayText: '⏳ STATUS' }, type: 1 },
-                { buttonId: '.owner', buttonText: { displayText: '👑 OWNER' }, type: 1 },
-                { buttonId: '.help', buttonText: { displayText: '📖 MENU' }, type: 1 }
-            ];
+            menuBody += `_📝 Use .command_name to execute a command_\n`;
+            menuBody += `_💡 Example: .alive_\n\n`;
+            menuBody += `_Version ${botVersion} | © 2026 Mickey Labs™_`;
 
-            await zephy.sendMessage(chatId, {
-                text: menuBody,
-                footer: '©2026 Mickey Labs™ — Mbande, Dar',
-                buttons,
-                headerType: 1
-            }, { quoted: message });
+            await sendMessage(menuBody);
 
-        } catch (e) {
-            console.error("Menu Button Error:", e);
-            // Fallback: Tuma text ya kawaida kama interactive ikifeli
-            await zephy.sendMessage(chatId, { text: "⚠️ Hitilafu ya Buttons! (Buttons error)." });
+        } catch (error) {
+            console.error("Menu error:", error);
+            await context.sendMessage(
+                Helpers.createErrorMessage(
+                    'Menu Error',
+                    'Failed to load menu',
+                    error.message
+                )
+            );
         }
     }
 };

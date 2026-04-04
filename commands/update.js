@@ -2,9 +2,52 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
+const chalk = require('chalk');
 
 const DEFAULT_REPO = 'https://github.com/Mickeydeveloper/Mickey-Glitch-Telegram';
 const DEFAULT_BRANCH = 'main';
+
+// ============================================
+//         DEPENDENCY CHECK
+// ============================================
+
+function checkDependencies() {
+    const requiredModules = [
+        'chalk',
+        'axios',
+        'moment-timezone',
+        './config',
+        './commandLoader'
+    ];
+
+    const missingModules = [];
+
+    for (const module of requiredModules) {
+        try {
+            if (module.startsWith('./')) {
+                require(module);
+            } else {
+                require.resolve(module);
+            }
+        } catch (error) {
+            missingModules.push(module);
+        }
+    }
+
+    if (missingModules.length > 0) {
+        console.error(chalk.red('❌ MISSING DEPENDENCIES FOR UPDATE:'));
+        console.error(chalk.yellow('Please run: npm install'));
+        console.error(chalk.red('Missing modules:'), missingModules.join(', '));
+        return false;
+    }
+
+    console.log(chalk.green('✅ Update dependencies found!'));
+    return true;
+}
+
+// ============================================
+//         UPDATE COMMAND
+// ============================================
 
 module.exports = {
     name: 'update',
@@ -17,6 +60,12 @@ module.exports = {
 
         if (!isOwner(userId) && !isDeveloper(userId)) {
             await sendMessage('❌ Only owner/developer can run this command.');
+            return;
+        }
+
+        // Check dependencies before proceeding
+        if (!checkDependencies()) {
+            await sendMessage('❌ Missing dependencies. Please install them first.');
             return;
         }
 
@@ -70,7 +119,14 @@ module.exports = {
 
             fs.rmSync(tempDir, { recursive: true, force: true });
 
-            await sendMessage('✅ Update complete. Files are synced from GitHub.');
+            await sendMessage('📦 Installing dependencies...');
+            execSync('npm install', {
+                cwd: projectRoot,
+                stdio: 'pipe',
+                timeout: 10 * 60 * 1000
+            });
+
+            await sendMessage('✅ Update complete. Files are synced from GitHub and dependencies installed.');
 
             if (restartFlag) {
                 await sendMessage('♻️ Restarting bot process now...');
