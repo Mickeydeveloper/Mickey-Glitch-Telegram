@@ -1,60 +1,60 @@
-const { sendButton } = require("gifted-btns"); // Hakikisha ume-install hii npm
+// Ping Command kwa Mickey Glitch
+const { GiftedButtons } = require("gifted-btns");
+const os = require('os');
 
-module.exports = [
-  {
+module.exports = {
     name: "ping",
-    alias: ["p", "speed"],
+    alias: ["p", "speed", "test"],
     category: "general",
-    desc: "Check bot speed with buttons (Angalia speed na button).",
+    desc: "Angalia kasi ya bot (Check bot speed).",
+
     async execute(from, Loftxmd, conText) {
-      const { reply, sender } = conText;
-      const start = Date.now();
-      const end = Date.now();
-      const speed = end - start;
+        const { reply, sender } = conText;
+        const start = Date.now();
+        
+        // Tunatuma msg ya kwanza kupima speed
+        await reply("_Pinging Mickey Glitch..._");
+        
+        const end = Date.now();
+        const speed = end - start;
 
-      // Muundo wa Button (Button structure)
-      const buttons = [
-        { buttonId: "runtime", buttonText: { displayText: "⏱️ Runtime" }, type: 1 },
-        { buttonId: "system", buttonText: { displayText: "🖥️ System Info" }, type: 1 },
-        { buttonId: "menu", buttonText: { displayText: "📜 Main Menu" }, type: 1 }
-      ];
+        // 1. Muundo wa Buttons (Gifted Logic)
+        const buttons = [
+            { 
+                buttonId: "runtime", 
+                buttonText: { displayText: "⏱️ RUNTIME" }, 
+                type: 1 
+            },
+            { 
+                buttonId: "system", 
+                buttonText: { displayText: "🖥️ SYSTEM" }, 
+                type: 1 
+            },
+            { 
+                buttonId: "menu", 
+                buttonText: { displayText: "📜 MENU" }, 
+                type: 1 
+            }
+        ];
 
-      const buttonMessage = {
-        text: `*🏓 PONG!*\n\n📍 *Speed:* ${speed}ms\n📍 *User:* @${sender.split("@")[0]}`,
-        footer: "© Mickey Glitch - 2026",
-        buttons: buttons,
-        headerType: 1,
-        mentions: [sender]
-      };
-
-      // Kutuma kwa kutumia gifted-btns logic
-      try {
-        await Loftxmd.sendMessage(from, buttonMessage);
-      } catch (e) {
-        // Fallback kama button ikizingua kwenye baadhi ya WhatsApp versions
-        return reply(`*🏓 Pong!* (${speed}ms)\n\n_Tumia amri za kawaida kama .runtime au .system_`);
-      }
+        // 2. Tuma ujumbe wenye buttons na muonekano (ExternalAdReply)
+        return await Loftxmd.sendMessage(from, {
+            text: `*🏓 PONG!*\n\n🚀 *Speed:* ${speed}ms\n📡 *Server:* ${os.platform()}\n👤 *User:* @${sender.split("@")[0]}`,
+            footer: "©2026 Mickey Glitch - High Speed Bot",
+            buttons: buttons,
+            headerType: 4,
+            mentions: [sender],
+            contextInfo: {
+                externalAdReply: {
+                    title: "MICKEY GLITCH PING",
+                    body: `Kasi ya sasa: ${speed}ms`,
+                    // Unaweza kuweka link ya picha yako hapa
+                    thumbnailUrl: "https://github.com/Mickeydeveloper.png", 
+                    sourceUrl: "https://whatsapp.com/channel/0029Vb6B9xFCxoAseuG1g610",
+                    mediaType: 1,
+                    renderLargerThumbnail: true
+                }
+            }
+        });
     }
-  },
-  {
-    name: "alive",
-    alias: ["mambo", "vipi"],
-    category: "general",
-    desc: "Check if bot is active (Angalia kama bot ipo hewani).",
-    async execute(from, Loftxmd, conText) {
-      const buttons = [
-        { buttonId: "ping", buttonText: { displayText: "⚡ Check Speed" }, type: 1 },
-        { buttonId: "owner", buttonText: { displayText: "👑 Owner" }, type: 1 }
-      ];
-
-      const aliveMsg = {
-        text: "👋 *Hujambo! Mimi ni Mickey Glitch.*\nNipo hewani na niko tayari kukusaidia leo!",
-        footer: "Powered by Mickey Dev",
-        buttons: buttons,
-        headerType: 1
-      };
-
-      return Loftxmd.sendMessage(from, aliveMsg);
-    }
-  }
-];
+};
