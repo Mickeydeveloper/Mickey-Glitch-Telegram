@@ -1,24 +1,26 @@
-const { Telegraf, Markup } = require("telegraf");
-const fs = require('fs');
-const path = require('path');
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion, 
+    makeCacheableSignalKeyStore, 
+    jidDecode, 
+    delay 
+} = require("@whiskeysockets/baileys");
+const { Telegraf } = require("telegraf");
 const pino = require('pino');
 const chalk = require('chalk');
 const { Boom } = require('@hapi/boom');
-const { GiftedButtons } = require("gifted-btns"); 
+const fs = require('fs');
 
-let makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay, makeCacheableSignalKeyStore, jidDecode;
-
-const { BOT_TOKEN, allowedDevelopers } = require("./config");
+// Configuration (Hakikisha file hili lipo au weka data zako hapa)
+const { BOT_TOKEN } = require("./config");
 const commandLoader = require('./commandLoader');
 
 const bot = new Telegraf(BOT_TOKEN);
 const SESSION_PATH = './session';
 
-async function initializeBaileys() {
-    const b = await import('@whiskeysockets/baileys');
-    ({ default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay, makeCacheableSignalKeyStore, jidDecode } = b);
-}
-
+// ====================== HELPER: DECODE JID ======================
 const decodeJid = (jid) => {
     if (!jid) return jid;
     if (/:\d+@/gi.test(jid)) {
@@ -40,7 +42,8 @@ async function startWhatsApp() {
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }))
         },
         logger: pino({ level: 'fatal' }),
-        browser: ["Mickey-Glitch", "Chrome", "20.0.04"]
+        browser: ["Mickey-Glitch", "Chrome", "20.0.04"],
+        printQRInTerminal: false // Tunatumia Pairing Code
     });
 
     zephy.ev.on('creds.update', saveCreds);
@@ -49,16 +52,7 @@ async function startWhatsApp() {
         const { connection, lastDisconnect } = up;
         if (connection === 'open') {
             console.log(chalk.green("✅ WhatsApp Connected!"));
-            // Ujumbe wa kwanza kuji-tag mwenyewe (Success notification)
-            const buttons = [
-                { buttonId: "menu", buttonText: { displayText: "📜 MENU" }, type: 1 }
-            ];
-            await zephy.sendMessage(zephy.user.id, {
-                text: "✅ *MICKEY GLITCH IS ACTIVE*",
-                footer: "Powered by Mickey Dev",
-                buttons: buttons,
-                headerType: 1
-            });
+            await zephy.sendMessage(zephy.user.id, { text: "🚀 *MICKEY GLITCH IS LIVE & CONNECTED*" });
         }
         if (connection === 'close') {
             let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
@@ -72,75 +66,105 @@ async function startWhatsApp() {
 
         const chatId = msg.key.remoteJid;
         const userId = decodeJid(msg.key.participant || msg.key.remoteJid);
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
 
-        let selectionId = msg.message.buttonsResponseMessage?.selectedButtonId || 
-                          msg.message.listResponseMessage?.singleSelectReply?.selectedRowId || 
-                          msg.message.templateButtonReplyMessage?.selectedId || null;
+        // --- PAIR COMMAND LOGIC (NDANI YA INDEX) ---
+        if (text.startsWith('.pair') || text.startsWith('/pair')) {
+            const args = text.split(/\s+/).slice(1);
+            const phoneNumber = args[0]?.replace(/[^0-9]/g, '');
 
-        let text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-        let input = selectionId || text;
+            if (!phoneNumber) {
+                return zephy.sendMessage(chatId, { text: "❌ Weka namba ya simu!\n*Mfano:* .pair 2557XXXXXXXX" }, { quoted: msg });
+            }
 
-        if (input.startsWith('.') || input.startsWith('/') || selectionId) {
-            const cleanText = (input.startsWith('.') || input.startsWith('/')) ? input.slice(1) : input;
-            const args = cleanText.trim().split(/\s+/);
+            try {
+                await zephy.sendMessage(chatId, { text: `⏳ _Tafadhali subiri, Mickey Glitch inatengeneza code kwa ${phoneNumber}..._` });
+                let code = await zephy.requestPairingCode(phoneNumber);
+                
+                let pairMsg = `✨ *MICKEY PAIRING CODE* ✨\n\n`;
+                pairMsg += `📱 *Namba:* ${phoneNumber}\n`;
+                pairMsg += `🔐 *Code:* *${code}*\n\n`;
+                pairMsg += `_Nenda WhatsApp Settings > Linked Devices > Link with phone number kisha weka hiyo code._`;
+
+                return await zephy.sendMessage(chatId, { text: pairMsg }, { quoted: msg });
+            } catch (e) {
+                return zephy.sendMessage(chatId, { text: `❌ Error: ${e.message}` });
+            }
+        }
+
+        // --- NYINGINEZO (KUPITIA COMMANDLOADER) ---
+        if (text.startsWith('.') || text.startsWith('/')) {
+            const args = text.slice(1).trim().split(/\s+/);
             const commandName = args.shift().toLowerCase();
 
-            // 🔥 FIX: Tunatengeneza 'context' yenye vigezo vyote kuzuia error za 'undefined'
-            const context = {
+            const conText = {
                 sock: zephy,
+                Loftxmd: zephy,
                 chatId,
                 userId,
                 msg,
                 args,
-                // Support zote mbili (Backwards Compatibility)
-                sendMessage: (t) => zephy.sendMessage(chatId, { text: t }, { quoted: msg }),
-                reply: (t) => zephy.sendMessage(chatId, { text: t }, { quoted: msg })
+                reply: (t) => zephy.sendMessage(chatId, { text: t }, { quoted: msg }),
+                sender: userId
             };
 
-            await commandLoader.execute(commandName, context);
+            await commandLoader.execute(commandName, conText);
         }
     });
 }
 
 // ====================== TELEGRAM ENGINE ======================
-bot.command(['pair', 'start'], async (ctx) => {
-    const args = ctx.message.text.split(' ').slice(1);
-    const context = {
-        type: 'telegram',
-        chatId: ctx.chat.id,
-        userId: ctx.from.id.toString(),
-        ctx,
-        args,
-        sendMessage: (t) => ctx.reply(t),
-        reply: (t) => ctx.reply(t)
-    };
-    await commandLoader.execute('pair', context);
-});
-
 bot.on('message', async (ctx) => {
     const text = ctx.message.text || '';
+    
+    // logic ya /pair kwa Telegram
+    if (text.startsWith('/pair') || text.startsWith('.pair')) {
+        const args = text.split(/\s+/).slice(1);
+        const phoneNumber = args[0]?.replace(/[^0-9]/g, '');
+
+        if (!phoneNumber) {
+            return ctx.reply("❌ Weka namba ya simu!\n*Usage:* /pair 2557XXXXXXXX");
+        }
+
+        // Hapa Telegram inatuma request kwenye system ya WhatsApp ili ipate code
+        // Kumbuka: Lazima kwanza uanzishe startWhatsApp()
+        ctx.reply(`⏳ Inatengeneza code kwa ${phoneNumber}... tafadhali tumia WhatsApp bot kupata code kamili.`);
+        // Hapa unaweza kuita function maalum kama unataka iwe fully automated
+    }
+
+    // Commands nyingine za Telegram
     if (text.startsWith('.') || text.startsWith('/')) {
         const args = text.slice(1).trim().split(/\s+/);
         const commandName = args.shift().toLowerCase();
 
-        const context = {
+        const conText = {
             type: 'telegram',
             chatId: ctx.chat.id,
             userId: ctx.from.id.toString(),
             ctx,
             args,
-            sendMessage: (t) => ctx.reply(t),
-            reply: (t) => ctx.reply(t)
+            reply: (t) => ctx.reply(t),
+            sender: ctx.from.id.toString()
         };
 
-        await commandLoader.execute(commandName, context);
+        await commandLoader.execute(commandName, conText);
     }
 });
 
 // ====================== LAUNCH ======================
 (async () => {
-    await initializeBaileys();
-    await commandLoader.loadAll();
-    bot.launch().then(() => console.log(chalk.blue('✓ Mickey Telegram Active')));
-    startWhatsApp();
+    try {
+        console.log(chalk.yellow("🛠️ Mickey Glitch Inawaka..."));
+        await commandLoader.loadAll();
+        
+        bot.launch().then(() => console.log(chalk.blue('✓ Mickey Telegram Active')));
+        
+        await startWhatsApp();
+    } catch (e) {
+        console.error(chalk.red("✗ Error wakati wa kuwasha:"), e);
+    }
 })();
+
+// Anti-Crash (Muhimu kwa server za Katabump)
+process.on('uncaughtException', (err) => console.error('Caught exception: ', err));
+process.on('unhandledRejection', (reason, p) => console.error('Unhandled Rejection at: Promise', p, 'reason:', reason));
