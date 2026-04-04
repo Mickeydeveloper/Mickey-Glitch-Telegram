@@ -3,35 +3,32 @@ const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
 const chalk = require('chalk');
-const { Boom } = require('@hapi/boom'); // Fix: Import Boom hivi
+const { Boom } = require('@hapi/boom');
 const { BOT_TOKEN, allowedDevelopers } = require("./config");
 const commandLoader = require('./commandLoader');
 
-let makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay, makeCacheableSignalKeyStore;
+let makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay, makeCacheableSignalKeyStore, jidDecode;
 
 const bot = new Telegraf(BOT_TOKEN);
 const SESSION_PATH = './session';
 
 async function initializeBaileys() {
     const b = await import('@whiskeysockets/baileys');
-    ({ default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay, makeCacheableSignalKeyStore } = b);
+    ({ default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay, makeCacheableSignalKeyStore, jidDecode } = b);
 }
 
-// ====================== UTILS ======================
-const printBox = (title, content, bgColor = chalk.bgCyan, textColor = chalk.white) => {
-    const maxLen = Math.max(title.length, content.length) + 10;
-    console.log(bgColor(`╔${'═'.repeat(maxLen)}╗`));
-    console.log(bgColor(`║   ${title.padEnd(maxLen - 3)}║`));
-    console.log(bgColor(`╠${'═'.repeat(maxLen)}╣`));
-    console.log(textColor(`║   ${content.padEnd(maxLen - 3)}║`));
-    console.log(bgColor(`╚${'═'.repeat(maxLen)}╝\n`));
+// ====================== HELPER: DECODE JID ======================
+const decodeJid = (jid) => {
+    if (!jid) return jid;
+    if (/:\d+@/gi.test(jid)) {
+        let decode = jidDecode(jid) || {};
+        return decode.user && decode.server && decode.user + '@' + decode.server || jid;
+    }
+    return jid;
 };
 
-// ====================== MAIN BOT ENGINE ======================
+// ====================== WHATSAPP ENGINE ======================
 async function startWhatsApp() {
-    const credsFile = path.join(SESSION_PATH, 'creds.json');
-    if (!fs.existsSync(credsFile)) return;
-
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -42,125 +39,109 @@ async function startWhatsApp() {
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }))
         },
         logger: pino({ level: 'fatal' }),
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
-        markOnlineOnConnect: true
+        browser: ["Mickey-Glitch", "Chrome", "20.0.04"],
+        printQRInTerminal: true
     });
 
     zephy.ev.on('creds.update', saveCreds);
 
     zephy.ev.on('connection.update', async (up) => {
         const { connection, lastDisconnect } = up;
-        if (connection === 'open') {
-            printBox("ONLINE", "Mickey Glitch Connected!", chalk.bgGreen, chalk.black);
-        }
+        if (connection === 'open') console.log(chalk.green("✅ WhatsApp Connected!"));
         if (connection === 'close') {
-            // Fix: Check Boom correctly
-            const isLoggedOut = lastDisconnect?.error instanceof Boom 
-                ? lastDisconnect.error.output.statusCode === DisconnectReason.loggedOut 
-                : false;
-
-            if (!isLoggedOut) {
-                console.log(chalk.yellow("🔄 Reconnecting WhatsApp..."));
-                setTimeout(startWhatsApp, 5000);
-            }
+            let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
+            if (reason !== DisconnectReason.loggedOut) startWhatsApp();
         }
     });
 
     zephy.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
-        if (!msg?.message || msg.key.remoteJid === 'status@broadcast') return;
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-        const context = { type: 'whatsapp', chatId: msg.key.remoteJid, sock: zephy, sendMessage: (t) => zephy.sendMessage(msg.key.remoteJid, { text: t }) };
-        let cmd = (text.startsWith('.') || text.startsWith('/')) ? text.slice(1).trim() : text;
-        const parts = cmd.split(/\s+/);
-        if (commandLoader.getCommand(parts[0]?.toLowerCase())) await commandLoader.execute(parts[0].toLowerCase(), { ...context, args: parts.slice(1) });
-    });
-}
+        if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
-// ====================== PAIRING ENGINE ======================
-async function startPairing(ctx, num, tempPath) {
-    const { state, saveCreds } = await useMultiFileAuthState(tempPath);
-    
-    const pairSock = makeWASocket({
-        auth: state,
-        logger: pino({ level: 'error' }), 
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
-        printQRInTerminal: false,
-        connectTimeoutMs: 60000
-    });
+        const chatId = msg.key.remoteJid;
+        const userId = decodeJid(msg.key.participant || msg.key.remoteJid);
+        
+        // --- BUTTON HANDLER (MSIKILIZAJI WA BUTTONS) ---
+        let selectionId = msg.message.buttonsResponseMessage?.selectedButtonId || 
+                          msg.message.listResponseMessage?.singleSelectReply?.selectedRowId || 
+                          msg.message.templateButtonReplyMessage?.selectedId;
 
-    pairSock.ev.on('creds.update', saveCreds);
-
-    pairSock.ev.on('connection.update', async (up) => {
-        const { connection, lastDisconnect } = up;
-
-        if (connection === 'open') {
-            printBox("SYNCING", "Finalizing Session...", chalk.bgBlue, chalk.white);
-            await delay(3000);
-            await saveCreds();
-
-            if (!fs.existsSync(SESSION_PATH)) fs.mkdirSync(SESSION_PATH, { recursive: true });
-            const files = fs.readdirSync(tempPath);
-            for (const f of files) {
-                fs.copyFileSync(path.join(tempPath, f), path.join(SESSION_PATH, f));
-            }
-
-            await ctx.reply('✅ *Connected!* Inawasha bot sasa...');
+        if (selectionId) {
+            console.log(chalk.cyan(`[BUTTON] Clicked: ${selectionId}`));
             
-            try { pairSock.end(); } catch (e) {}
-            fs.rmSync(tempPath, { recursive: true, force: true });
-            setTimeout(startWhatsApp, 2000);
+            // Logic ya Git Downloader
+            if (selectionId.startsWith('gitdl_zip_')) {
+                const [, , user, repo] = selectionId.split('_');
+                const zipUrl = `https://github.com/${user}/${repo}/archive/refs/heads/main.zip`;
+                await zephy.sendMessage(chatId, { 
+                    document: { url: zipUrl }, 
+                    fileName: `${repo}.zip`, 
+                    mimetype: 'application/zip',
+                    caption: `✅ ZIP ya repo *${repo}* imetayarishwa.`
+                }, { quoted: msg });
+                return;
+            }
         }
 
-        if (connection === 'close') {
-            const isLoggedOut = lastDisconnect?.error instanceof Boom 
-                ? lastDisconnect.error.output.statusCode === DisconnectReason.loggedOut 
-                : false;
+        // --- COMMAND HANDLER ---
+        let text = msg.message.conversation || msg.message.extendedTextMessage?.text || selectionId || '';
+        if (text.startsWith('.') || text.startsWith('/')) {
+            const args = text.slice(1).trim().split(/\s+/);
+            const commandName = args.shift().toLowerCase();
+            
+            const context = {
+                type: 'whatsapp',
+                chatId,
+                userId,
+                sock: zephy,
+                msg,
+                args,
+                sendMessage: (t) => zephy.sendMessage(chatId, { text: t }, { quoted: msg })
+            };
 
-            if (!isLoggedOut && !fs.existsSync(SESSION_PATH)) {
-                console.log(chalk.yellow("🔄 Re-attempting pairing connection..."));
-                setTimeout(() => startPairing(ctx, num, tempPath), 5000);
-            }
+            await commandLoader.execute(commandName, context);
         }
     });
-
-    if (!state.creds.registered) {
-        setTimeout(async () => {
-            try {
-                const code = await pairSock.requestPairingCode(num);
-                await ctx.reply(`🔐 *Pairing Code:* \`${code}\`\n\nIngiza sasa kwenye WhatsApp yako.`);
-            } catch (e) {
-                console.error(chalk.red("Pairing Request Fail:"), e.message);
-            }
-        }, 5000);
-    }
 }
+
+// ====================== TELEGRAM ENGINE ======================
+bot.on('callback_query', async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    if (data.startsWith('gitdl_zip_')) {
+        const [, , user, repo] = data.split('_');
+        const zipUrl = `https://github.com/${user}/${repo}/archive/refs/heads/main.zip`;
+        await ctx.replyWithDocument({ url: zipUrl, filename: `${repo}.zip` });
+    }
+    await ctx.answerCbQuery();
+});
 
 bot.on('message', async (ctx) => {
-    const text = (ctx.message.text || '').trim();
-    if (text.startsWith('/pair')) {
-        if (!allowedDevelopers.includes(ctx.from.id.toString())) return;
-        let num = text.split(' ')[1]?.replace(/[^0-9]/g, '');
-        if (!num) return ctx.reply('❌ Format: /pair 255xxxxxxxxx');
-        
-        const tempPath = `./sessions/pair_${ctx.from.id}`;
-        if (fs.existsSync(tempPath)) fs.rmSync(tempPath, { recursive: true, force: true });
-        
-        ctx.reply('⏳ Requesting Pairing Code...');
-        startPairing(ctx, num, tempPath);
+    const text = ctx.message.text || '';
+    if (text.startsWith('.') || text.startsWith('/')) {
+        const args = text.slice(1).trim().split(/\s+/);
+        const commandName = args.shift().toLowerCase();
+
+        const context = {
+            type: 'telegram',
+            chatId: ctx.chat.id,
+            userId: ctx.from.id.toString(),
+            ctx,
+            args,
+            sendMessage: (t) => ctx.reply(t)
+        };
+
+        await commandLoader.execute(commandName, context);
     }
 });
 
-// Anti-Crash Process Handlers
-process.on('uncaughtException', (err) => {
-    if (err.message.includes('Boom')) return; // Ignore boom errors
-    console.error(chalk.red('Caught exception: '), err);
-});
-
+// ====================== LAUNCH ======================
 (async () => {
     await initializeBaileys();
     await commandLoader.loadAll();
-    bot.launch();
-    console.log(chalk.cyan('✓ Mickey Glitch Active (Telegram)'));
+    
+    // Start Telegram
+    bot.launch().then(() => console.log(chalk.blue('✓ Mickey Telegram Active')));
+    
+    // Start WhatsApp
     startWhatsApp();
 })();
