@@ -4,145 +4,109 @@ const os = require('os');
 const { execSync } = require('child_process');
 const chalk = require('chalk');
 
+// Ingiza config ili kupata list ya ma-owner
+const { allowedDevelopers } = require('../config');
+
 const DEFAULT_REPO = 'https://github.com/Mickeydeveloper/Mickey-Glitch-Telegram';
 const DEFAULT_BRANCH = 'main';
+
+// Function ya ku-check kama ni Owner
+const checkIsOwner = (userId) => {
+    return allowedDevelopers.includes(userId?.toString());
+};
 
 // ============================================
 //         DEPENDENCY CHECK
 // ============================================
-
 function checkDependencies() {
-    const requiredModules = [
-        'chalk',
-        'axios',
-        'moment-timezone',
-        './config',
-        './commandLoader'
-    ];
-
+    const requiredModules = ['chalk', 'axios', 'moment-timezone'];
     const missingModules = [];
 
-    for (const module of requiredModules) {
+    for (const mod of requiredModules) {
         try {
-            if (module.startsWith('./')) {
-                require(module);
-            } else {
-                require.resolve(module);
-            }
+            require.resolve(mod);
         } catch (error) {
-            missingModules.push(module);
+            missingModules.push(mod);
         }
     }
 
     if (missingModules.length > 0) {
-        console.error(chalk.red('❌ MISSING DEPENDENCIES FOR UPDATE:'));
-        console.error(chalk.yellow('Please run: npm install'));
-        console.error(chalk.red('Missing modules:'), missingModules.join(', '));
+        console.error(chalk.red('❌ MISSING:'), missingModules.join(', '));
         return false;
     }
-
-    console.log(chalk.green('✅ Update dependencies found!'));
     return true;
 }
 
-// ============================================
-//         UPDATE COMMAND
-// ============================================
-
 module.exports = {
     name: 'update',
-    description: 'Update bot files from a GitHub repo (owner/developer only)',
+    description: 'Update bot files from GitHub',
     aliases: ['upgrade', 'pull', 'sync'],
     category: 'owner',
 
     async execute(context) {
-        const { args = [], sendMessage, userId, isOwner, isDeveloper } = context;
+        const { args = [], sendMessage, userId } = context;
 
-        if (!isOwner(userId) && !isDeveloper(userId)) {
-            await sendMessage('❌ Only owner/developer can run this command.');
-            return;
+        // FIX: Tumia function yetu ya ndani badala ya context.isOwner inayofeli
+        if (!checkIsOwner(userId)) {
+            return await sendMessage('❌ Command hii ni kwa ajili ya Owner tu!');
         }
 
-        // Check dependencies before proceeding
         if (!checkDependencies()) {
-            await sendMessage('❌ Missing dependencies. Please install them first.');
-            return;
+            return await sendMessage('❌ Tafadhali install dependencies kwanza: `npm install`');
         }
 
-        const repoArg = args[0] || DEFAULT_REPO;
         const branchArg = args[1] || DEFAULT_BRANCH;
-        const restartFlag = args[2] === 'restart' || args[2] === 'reboot';
-
-        let cloneUrl = repoArg;
-        if (!/^https?:\/\//i.test(cloneUrl)) {
-            if (/^[\w-]+\/[\w-]+$/.test(cloneUrl)) {
-                cloneUrl = `https://github.com/${cloneUrl}.git`;
-            } else {
-                cloneUrl = `https://github.com/${cloneUrl}`;
-            }
-        }
-
-        const projectRoot = path.resolve(__dirname, '..');
+        const projectRoot = path.join(__dirname, '../../'); // Hakikisha inaenda kwenye root folder
         const tempDir = path.join(os.tmpdir(), `bot-update-${Date.now()}`);
 
         try {
-            await sendMessage(`🔄 Starting update from ${cloneUrl} branch ${branchArg}...`);
+            await sendMessage(`🔄 *Mickey Glitch Update*\nChecking for updates from GitHub...`);
 
-            fs.rmSync(tempDir, { recursive: true, force: true });
+            // Safisha temp folder kama lipo
+            if (fs.existsSync(tempPath)) fs.rmSync(tempPath, { recursive: true, force: true });
             fs.mkdirSync(tempDir, { recursive: true });
 
-            execSync(`git clone --depth=1 --branch ${branchArg} "${cloneUrl}" "${tempDir}"`, {
+            // Clone repo
+            await sendMessage(`📥 Downloading files (Branch: ${branchArg})...`);
+            execSync(`git clone --depth=1 --branch ${branchArg} "${DEFAULT_REPO}" "${tempDir}"`, {
                 stdio: 'pipe',
-                timeout: 5 * 60 * 1000
+                timeout: 300000
             });
 
-            const copyRecursive = (srcDir, destDir) => {
-                const entries = fs.readdirSync(srcDir, { withFileTypes: true });
-
+            // Copy files recursive function
+            const copyFiles = (src, dest) => {
+                const entries = fs.readdirSync(src, { withFileTypes: true });
                 for (const entry of entries) {
-                    if (entry.name === '.git' || entry.name === 'node_modules') continue;
-
-                    const srcPath = path.join(srcDir, entry.name);
-                    const destPath = path.join(destDir, entry.name);
+                    if (['.git', 'node_modules', 'session', 'sessions', 'config.js'].includes(entry.name)) continue;
+                    
+                    const srcPath = path.join(src, entry.name);
+                    const destPath = path.join(dest, entry.name);
 
                     if (entry.isDirectory()) {
                         if (!fs.existsSync(destPath)) fs.mkdirSync(destPath, { recursive: true });
-                        copyRecursive(srcPath, destPath);
-                        continue;
+                        copyFiles(srcPath, destPath);
+                    } else {
+                        fs.copyFileSync(srcPath, destPath);
                     }
-
-                    fs.copyFileSync(srcPath, destPath);
                 }
             };
 
-            copyRecursive(tempDir, projectRoot);
+            copyFiles(tempDir, projectRoot);
 
+            // Safisha temp
             fs.rmSync(tempDir, { recursive: true, force: true });
 
-            await sendMessage('📦 Installing dependencies...');
-            execSync('npm install', {
-                cwd: projectRoot,
-                stdio: 'pipe',
-                timeout: 10 * 60 * 1000
-            });
+            await sendMessage('📦 Installing/Updating npm packages...');
+            execSync('npm install', { cwd: projectRoot, stdio: 'pipe' });
 
-            await sendMessage('✅ Update complete. Files are synced from GitHub and dependencies installed.');
+            await sendMessage('✅ *UPDATE COMPLETE*\n\nBot itajizima sasa hivi. Tafadhali iwashe upya (Restart).');
+            
+            // Exit ili bot i-restart kama unatumia PM2 au Auto-restart script
+            setTimeout(() => process.exit(0), 3000);
 
-            if (restartFlag) {
-                await sendMessage('♻️ Restarting bot process now...');
-                process.exit(0);
-            } else {
-                await sendMessage('⚠️ Please restart the bot process manually for changes to take effect.');
-            }
         } catch (error) {
-            try {
-                fs.rmSync(tempDir, { recursive: true, force: true });
-            } catch (e) {
-                // ignore cleanup errors
-            }
-
-            await sendMessage(`❌ Update failed: ${error.message}`);
-            console.error('Update command failed:', error);
+            console.error('Update Error:', error);
+            await sendMessage(`❌ Update Failed: ${error.message}`);
         }
     }
 };
