@@ -1,170 +1,162 @@
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    DisconnectReason, 
-    fetchLatestBaileysVersion, 
-    makeCacheableSignalKeyStore, 
-    jidDecode, 
-    delay 
-} = require("@whiskeysockets/baileys");
-const { Telegraf } = require("telegraf");
-const pino = require('pino');
-const chalk = require('chalk');
-const { Boom } = require('@hapi/boom');
-const fs = require('fs');
+require('dotenv').config()
+require('./settings')
+const { Boom } = require('@hapi/boom')
+const fs = require('fs')
+const chalk = require('chalk')
+const path = require('path')
+const { exec } = require('child_process')
+const TelegramBot = require('node-telegram-bot-api') // Library ya Telegram
+const { handleMessages, handleStatus } = require('./main')
 
-// Configuration (Hakikisha file hili lipo au weka data zako hapa)
-const { BOT_TOKEN } = require("./config");
-const commandLoader = require('./commandLoader');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    jidNormalizedUser,
+    makeCacheableSignalKeyStore,
+    delay
+} = require("@whiskeysockets/baileys")
 
-const bot = new Telegraf(BOT_TOKEN);
-const SESSION_PATH = './session';
+const NodeCache = require("node-cache")
+const pino = require("pino")
 
-// ====================== HELPER: DECODE JID ======================
-const decodeJid = (jid) => {
-    if (!jid) return jid;
-    if (/:\d+@/gi.test(jid)) {
-        let decode = jidDecode(jid) || {};
-        return decode.user && decode.server && decode.user + '@' + decode.server || jid;
+// ====================== CONFIG ======================
+global.botname = "𝙼𝚒𝚌𝚔𝚎𝚈 𝙶𝚕𝚒𝚝𝚌𝚑™"
+const TG_TOKEN = process.env.TG_TOKEN || 'WEKA_TOKEN_YAKO_HAPA' // Token kutoka BotFather
+const tgBot = new TelegramBot(TG_TOKEN, { polling: true })
+
+const channelRD = {
+    id: '120363398106360290@newsletter',
+    name: '🅼🅸🅲🅺🅴🆈'
+}
+
+global.commands = new Map()
+
+// ====================== AUTO COMMAND LOADER ======================
+const loadCommands = () => {
+    const commandsPath = path.join(__dirname, 'commands')
+    if (!fs.existsSync(commandsPath)) fs.mkdirSync(commandsPath)
+    const files = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'))
+    for (const file of files) {
+        try {
+            const command = require(`./commands/${file}`)
+            if (command.name) {
+                global.commands.set(command.name, command)
+                if (command.alias) command.alias.forEach(a => global.commands.set(a, command))
+            }
+        } catch (e) { console.log(chalk.red(`❌ Error loading ${file}: ${e.message}`)) }
     }
-    return jid;
-};
+    console.log(chalk.greenBright(`✨ Loaded ${global.commands.size} commands!`))
+}
 
-// ====================== WHATSAPP ENGINE ======================
-async function startWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
-    const { version } = await fetchLatestBaileysVersion();
+// ====================== CLEANERS & UPDATER ======================
+const autoUpdate = () => {
+    exec('git pull', (err, stdout) => {
+        if (stdout && !stdout.includes('Already up to date.')) process.exit(0)
+    })
+}
 
-    const zephy = makeWASocket({
+const cleanFiles = () => {
+    const folders = ['./tmp', './temp']
+    folders.forEach(dir => {
+        if (fs.existsSync(dir)) {
+            fs.readdirSync(dir).forEach(f => { try { fs.unlinkSync(path.join(dir, f)) } catch {} })
+        }
+    })
+    // Clean old session files (Keep creds.json)
+    const sess = './session'
+    if (fs.existsSync(sess)) {
+        fs.readdirSync(sess).forEach(f => {
+            if (f !== 'creds.json' && (Date.now() - fs.statSync(path.join(sess, f)).mtimeMs > 86400000)) {
+                try { fs.unlinkSync(path.join(sess, f)) } catch {}
+            }
+        })
+    }
+}
+setInterval(cleanFiles, 3600000)
+
+// ====================== SUPPRESS ERRORS ======================
+console.error = (orig => (...args) => {
+    if (!args.join(' ').match(/Bad MAC|verifyMAC|closed session/)) orig.apply(console, args)
+})(console.error)
+
+// ====================== BOT START ======================
+async function startMickeyBot() {
+    autoUpdate()
+    loadCommands()
+
+    const { state, saveCreds } = await useMultiFileAuthState('./session')
+    const { version } = await fetchLatestBaileysVersion()
+
+    const sock = makeWASocket({
         version,
+        logger: pino({ level: 'fatal' }),
+        printQRInTerminal: false, // Tunatumia Pairing Code pekee
+        browser: ["Ubuntu", "Chrome", "20.0.04"],
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }))
         },
-        logger: pino({ level: 'fatal' }),
-        browser: ["Mickey-Glitch", "Chrome", "20.0.04"],
-        printQRInTerminal: false // Tunatumia Pairing Code
-    });
+        getMessage: async (key) => {
+            return (await require('./lib/lightweight_store').loadMessage(jidNormalizedUser(key.remoteJid), key.id))?.message || undefined
+        }
+    })
 
-    zephy.ev.on('creds.update', saveCreds);
+    // ====================== TELEGRAM PAIRING LOGIC ======================
+    tgBot.onText(/\/start/, (msg) => {
+        tgBot.sendMessage(msg.chat.id, `👋 Hello ${msg.from.first_name}!\n\nNitumie namba yako ya simu iliyopo WhatsApp ili nikupe Pairing Code.\n\nMfano: \`255615858685\``, { parse_mode: 'Markdown' })
+    })
 
-    zephy.ev.on('connection.update', async (up) => {
-        const { connection, lastDisconnect } = up;
+    tgBot.on('message', async (msg) => {
+        const text = msg.text
+        if (text && /^\d+$/.test(text) && !sock.authState.creds.registered) {
+            let number = text.replace(/[^0-9]/g, '')
+            if (!number.startsWith('255')) number = '255' + number
+            
+            try {
+                tgBot.sendMessage(msg.chat.id, `⏳ Inatengeneza code kwa namba: ${number}...`)
+                await delay(2000)
+                let code = await sock.requestPairingCode(number, "MICKDADY")
+                tgBot.sendMessage(msg.chat.id, `✅ **PAIRING CODE YAKO:**\n\n\`${code}\`\n\nFungua WhatsApp > Linked Devices > Link with phone number alafu uweke hiyo code.`, { parse_mode: 'Markdown' })
+            } catch (e) {
+                tgBot.sendMessage(msg.chat.id, `❌ Error: ${e.message}`)
+            }
+        }
+    })
+
+    sock.ev.on('creds.update', saveCreds)
+
+    sock.ev.on('messages.upsert', async chatUpdate => {
+        const mek = chatUpdate.messages[0]
+        if (!mek || !mek.message) return
+        if (mek.key.remoteJid === 'status@broadcast') return await handleStatus(sock, chatUpdate)
+
+        const forwardContext = {
+            isForwarded: true,
+            forwardingScore: 999,
+            forwardedNewsletterMessageInfo: { newsletterJid: channelRD.id, newsletterName: channelRD.name },
+            externalAdReply: {
+                title: `ᴍɪᴄᴋᴇʏ ɢʟɪᴛᴄʜ ᴠ3.1.0`,
+                body: `Telegram Pairing Active`,
+                thumbnailUrl: 'https://files.catbox.moe/jwdiuc.jpg',
+                mediaType: 1,
+                renderLargerThumbnail: true
+            }
+        }
+        await handleMessages(sock, chatUpdate, true, forwardContext)
+    })
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update
         if (connection === 'open') {
-            console.log(chalk.green("✅ WhatsApp Connected!"));
-            await zephy.sendMessage(zephy.user.id, { text: "🚀 *MICKEY GLITCH IS LIVE & CONNECTED*" });
+            console.log(chalk.bgGreen.black(' ✨ MICKEY CONNECTED SUCCESSFULLY ✨ '))
+            tgBot.sendMessage(process.env.TG_CHAT_ID, "🚀 **Bot yako ipo Online sasa hivi!**")
         }
         if (connection === 'close') {
-            let reason = new Boom(lastDisconnect?.error)?.output.statusCode;
-            if (reason !== DisconnectReason.loggedOut) startWhatsApp();
+            if (new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut) startMickeyBot()
         }
-    });
-
-    zephy.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
-
-        const chatId = msg.key.remoteJid;
-        const userId = decodeJid(msg.key.participant || msg.key.remoteJid);
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-
-        // --- PAIR COMMAND LOGIC (NDANI YA INDEX) ---
-        if (text.startsWith('.pair') || text.startsWith('/pair')) {
-            const args = text.split(/\s+/).slice(1);
-            const phoneNumber = args[0]?.replace(/[^0-9]/g, '');
-
-            if (!phoneNumber) {
-                return zephy.sendMessage(chatId, { text: "❌ Weka namba ya simu!\n*Mfano:* .pair 2557XXXXXXXX" }, { quoted: msg });
-            }
-
-            try {
-                await zephy.sendMessage(chatId, { text: `⏳ _Tafadhali subiri, Mickey Glitch inatengeneza code kwa ${phoneNumber}..._` });
-                let code = await zephy.requestPairingCode(phoneNumber);
-                
-                let pairMsg = `✨ *MICKEY PAIRING CODE* ✨\n\n`;
-                pairMsg += `📱 *Namba:* ${phoneNumber}\n`;
-                pairMsg += `🔐 *Code:* *${code}*\n\n`;
-                pairMsg += `_Nenda WhatsApp Settings > Linked Devices > Link with phone number kisha weka hiyo code._`;
-
-                return await zephy.sendMessage(chatId, { text: pairMsg }, { quoted: msg });
-            } catch (e) {
-                return zephy.sendMessage(chatId, { text: `❌ Error: ${e.message}` });
-            }
-        }
-
-        // --- NYINGINEZO (KUPITIA COMMANDLOADER) ---
-        if (text.startsWith('.') || text.startsWith('/')) {
-            const args = text.slice(1).trim().split(/\s+/);
-            const commandName = args.shift().toLowerCase();
-
-            const conText = {
-                sock: zephy,
-                Loftxmd: zephy,
-                chatId,
-                userId,
-                msg,
-                args,
-                reply: (t) => zephy.sendMessage(chatId, { text: t }, { quoted: msg }),
-                sender: userId
-            };
-
-            await commandLoader.execute(commandName, conText);
-        }
-    });
+    })
 }
 
-// ====================== TELEGRAM ENGINE ======================
-bot.on('message', async (ctx) => {
-    const text = ctx.message.text || '';
-    
-    // logic ya /pair kwa Telegram
-    if (text.startsWith('/pair') || text.startsWith('.pair')) {
-        const args = text.split(/\s+/).slice(1);
-        const phoneNumber = args[0]?.replace(/[^0-9]/g, '');
-
-        if (!phoneNumber) {
-            return ctx.reply("❌ Weka namba ya simu!\n*Usage:* /pair 2557XXXXXXXX");
-        }
-
-        // Hapa Telegram inatuma request kwenye system ya WhatsApp ili ipate code
-        // Kumbuka: Lazima kwanza uanzishe startWhatsApp()
-        ctx.reply(`⏳ Inatengeneza code kwa ${phoneNumber}... tafadhali tumia WhatsApp bot kupata code kamili.`);
-        // Hapa unaweza kuita function maalum kama unataka iwe fully automated
-    }
-
-    // Commands nyingine za Telegram
-    if (text.startsWith('.') || text.startsWith('/')) {
-        const args = text.slice(1).trim().split(/\s+/);
-        const commandName = args.shift().toLowerCase();
-
-        const conText = {
-            type: 'telegram',
-            chatId: ctx.chat.id,
-            userId: ctx.from.id.toString(),
-            ctx,
-            args,
-            reply: (t) => ctx.reply(t),
-            sender: ctx.from.id.toString()
-        };
-
-        await commandLoader.execute(commandName, conText);
-    }
-});
-
-// ====================== LAUNCH ======================
-(async () => {
-    try {
-        console.log(chalk.yellow("🛠️ Mickey Glitch Inawaka..."));
-        await commandLoader.loadAll();
-        
-        bot.launch().then(() => console.log(chalk.blue('✓ Mickey Telegram Active')));
-        
-        await startWhatsApp();
-    } catch (e) {
-        console.error(chalk.red("✗ Error wakati wa kuwasha:"), e);
-    }
-})();
-
-// Anti-Crash (Muhimu kwa server za Katabump)
-process.on('uncaughtException', (err) => console.error('Caught exception: ', err));
-process.on('unhandledRejection', (reason, p) => console.error('Unhandled Rejection at: Promise', p, 'reason:', reason));
+startMickeyBot()
