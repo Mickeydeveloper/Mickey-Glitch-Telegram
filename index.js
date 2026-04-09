@@ -20,7 +20,7 @@ const {
 
 const NodeCache = require("node-cache")
 const pino = require("pino")
-const readline = require("readline")
+const moment = require('moment-timezone');
 
 // ====================== GLOBAL CONFIG ======================
 global.botname = "𝙼𝚒𝚌𝚔𝚎𝚈 𝙶𝚕𝚒𝚝𝚌𝚑™"
@@ -100,6 +100,84 @@ const printBox = (title, content, bgColor = chalk.bgCyan, textColor = chalk.whit
     console.log(bgColor(`╚${topBottom}╝\n`))
 }
 
+// ====================== UTILITY FUNCTIONS ======================
+const COMMAND_PREFIX = process.env.BOT_PREFIX || '.';
+
+const saveAdmins = () => fs.writeFileSync('./admins.json', JSON.stringify(global.adminList));
+const loadAdmins = () => {
+    try {
+        global.adminList = JSON.parse(fs.readFileSync('./admins.json'));
+    } catch (error) {
+        console.error(chalk.red('Failed to load admin list'), error.message);
+        global.adminList = [];
+    }
+};
+
+const addPremiumUser = (userId, durationDays) => {
+    userId = userId.toString();
+    const moment = require('moment-timezone');
+    const expirationDate = moment().tz('Asia/Jakarta').add(durationDays, 'days');
+    global.premiumUsers[userId] = { expired: expirationDate.format('YYYY-MM-DD HH:mm:ss') };
+    savePremiumUsers();
+};
+
+const removePremiumUser = (userId) => {
+    delete global.premiumUsers[userId];
+    savePremiumUsers();
+};
+
+const isPremiumUser = (userId) => {
+    const userData = global.premiumUsers[userId];
+    if (!userData) return false;
+    const moment = require('moment-timezone');
+    const now = moment().tz('Asia/Jakarta');
+    const expirationDate = moment(userData.expired, 'YYYY-MM-DD HH:mm:ss').tz('Asia/Jakarta');
+    return now.isBefore(expirationDate);
+};
+
+const savePremiumUsers = () => fs.writeFileSync('./premiumUsers.json', JSON.stringify(global.premiumUsers));
+const loadPremiumUsers = () => {
+    try {
+        global.premiumUsers = JSON.parse(fs.readFileSync('./premiumUsers.json'));
+    } catch (error) {
+        console.error(chalk.red('Failed to load premium users'), error.message);
+        global.premiumUsers = {};
+    }
+};
+
+const loadDeviceList = () => {
+    try {
+        global.deviceList = JSON.parse(fs.readFileSync('./ListDevice.json'));
+    } catch (error) {
+        console.error(chalk.red('Failed to load device list'), error.message);
+        global.deviceList = [];
+    }
+};
+
+const saveDeviceList = () => fs.writeFileSync('./ListDevice.json', JSON.stringify(global.deviceList));
+
+const recordUserActivity = (userId, userNickname) => {
+    const moment = require('moment-timezone');
+    const now = moment().tz('Asia/Jakarta').format('YYYY-MM-DD HH:mm:ss');
+    global.userActivity[userId] = { nickname: userNickname, last_seen: now };
+    fs.writeFileSync('./userActivity.json', JSON.stringify(global.userActivity));
+};
+
+const loadUserActivity = () => {
+    try {
+        global.userActivity = JSON.parse(fs.readFileSync('./userActivity.json'));
+    } catch (error) {
+        console.error(chalk.red('Failed to load user activity'), error.message);
+        global.userActivity = {};
+    }
+};
+
+// Load data
+loadAdmins();
+loadPremiumUsers();
+loadDeviceList();
+loadUserActivity();
+
 // ====================== BOT START ======================
 async function startMickeyBot() {
     autoUpdate()
@@ -121,7 +199,11 @@ async function startMickeyBot() {
         },
         markOnlineOnConnect: true,
         getMessage: async (key) => {
-            return (await require('./lib/lightweight_store').loadMessage(jidNormalizedUser(key.remoteJid), key.id))?.message || undefined
+            try {
+                return (await require('./lib/lightweight_store').loadMessage(jidNormalizedUser(key.remoteJid), key.id))?.message || undefined
+            } catch (e) {
+                return undefined
+            }
         }
     })
 

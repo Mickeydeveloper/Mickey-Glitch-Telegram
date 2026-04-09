@@ -71,6 +71,15 @@ class CommandLoader {
             if (conText.reply) conText.reply(`❌ Error: ${error.message}`);
         }
     }
+
+    getCommand(commandName) {
+        const name = commandName.toLowerCase();
+        return this.commands.get(name) || this.commands.get(this.aliases.get(name));
+    }
+
+    getAllCommands() {
+        return Array.from(this.commands.keys());
+    }
 }
 
 module.exports = new CommandLoader();

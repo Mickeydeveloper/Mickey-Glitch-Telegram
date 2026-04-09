@@ -1,0 +1,65 @@
+const { GiftedButtons } = require("gifted-btns");
+const { delay } = require("@whiskeysockets/baileys");
+
+module.exports = {
+    name: "pair",
+    alias: ["pairing", "connect"],
+    category: "owner",
+    desc: "Get pairing code for WhatsApp.",
+
+    async execute(from, Loftxmd, conText) {
+        const { reply, args, userId } = conText;
+
+        // Kama ni Telegram, tunahitaji namba ya simu kwenye args
+        const phoneNumber = args[0];
+
+        if (!phoneNumber) {
+            return reply("❌ Tafadhali weka namba ya simu!\n*Usage:* .pair 2557XXXXXXXX");
+        }
+
+        try {
+            await reply("_Tafadhali subiri, Mickey Glitch inatengeneza code..._");
+
+            // Logic ya kupata pairing code
+            let code = await Loftxmd.query({
+                tag: 'iq',
+                attrs: {
+                    to: 's.whatsapp.net',
+                    type: 'set',
+                    xmlns: 'md',
+                },
+                content: [
+                    {
+                        tag: 'pair-device',
+                        attrs: { jid: Loftxmd.user.id },
+                        content: [
+                            {
+                                tag: 'pair-code',
+                                attrs: { 'phone-number': phoneNumber },
+                            }
+                        ]
+                    }
+                ]
+            });
+
+            const pairingCode = code.content[0].attrs.code || "Imeshindwa";
+
+            // Buttons za Gifted-Btns
+            const buttons = [
+                { buttonId: "menu", buttonText: { displayText: "📜 MENU" }, type: 1 },
+                { buttonId: "ping", buttonText: { displayText: "⚡ SPEED" }, type: 1 }
+            ];
+
+            return await Loftxmd.sendMessage(from, {
+                text: `✨ *MICKEY PAIRING CODE* ✨\n\nNamba: *${phoneNumber}*\nCode: *${pairingCode}*\n\n_Ingia WhatsApp > Linked Devices > Link with phone number kisha weka hiyo code._`,
+                footer: "©2026 Mickey Glitch",
+                buttons: buttons,
+                headerType: 1
+            });
+
+        } catch (error) {
+            console.error("Pairing Error:", error);
+            return reply(`❌ Imefeli: ${error.message}`);
+        }
+    }
+};

@@ -7,62 +7,75 @@ module.exports = {
     category: 'downloader',
 
     async execute(context) {
-        const { sock, chatId, args, sendMessage, msg, type, ctx } = context;
+        const { sock, chatId, args, reply, msg, type, ctx } = context;
         const videoUrl = args[0];
 
         if (!videoUrl) {
-            return sendMessage("❌ Tafadhali weka link! \n*Usage:* .download https://link-ya-video");
+            return await reply("❌ Please provide a video link!\n*Usage:* .download <video-url>");
         }
 
         try {
-            await sendMessage("⏳ _Inatafuta video, tafadhali subiri..._");
+            await reply("⏳ Downloading video, please wait...");
 
-            // Encode link ili isilete error kwenye URL
+            // Set timeout for API call
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 30000);
+
             const apiUrl = `https://nayan-video-downloader.vercel.app/alldown?url=${encodeURIComponent(videoUrl)}`;
-            const response = await axios.get(apiUrl);
+            const response = await axios.get(apiUrl, { signal: controller.signal });
+            clearTimeout(timeoutId);
             
-            // Angalia muundo wa data (Nayan API wakati mwingine inarudisha data ndani ya data)
             const res = response.data;
             const mainData = res.data?.data || res.data; 
 
             if (!mainData || (!mainData.high && !mainData.low)) {
-                return sendMessage("❌ API imeshindwa kupata video hii sasa hivi. Jaribu tena baadae.");
+                return await reply("❌ Could not retrieve video. Please try again later.");
             }
 
-            const title = mainData.title || "Mickey Video";
+            const title = (mainData.title || "Video").substring(0, 50);
             const videoLink = mainData.high || mainData.low;
             const thumb = mainData.thumbnail || "";
 
             if (type === 'whatsapp') {
-                // Tuma Info na Picha kwanza (WhatsApp)
-                await sock.sendMessage(chatId, {
-                    text: `🎬 *DOWNLOAD READY* 🎬\n\n📌 *Title:* ${title}\n🚀 *Status:* Sending Video...`,
-                    contextInfo: {
-                        externalAdReply: {
-                            title: "MICKEY GLITCH DL",
-                            body: title,
-                            thumbnailUrl: thumb,
-                            mediaType: 1,
-                            renderLargerThumbnail: true
+                try {
+                    await sock.sendMessage(chatId, {
+                        text: `🎬 *DOWNLOAD READY* 🎬\n\n📌 *Title:* ${title}\n🚀 *Status:* Sending Video...`,
+                        contextInfo: {
+                            externalAdReply: {
+                                title: "MICKEY GLITCH DL",
+                                body: title,
+                                thumbnailUrl: thumb,
+                                mediaType: 1,
+                                renderLargerThumbnail: true
+                            }
                         }
-                    }
-                }, { quoted: msg });
+                    }, { quoted: msg });
 
-                // Tuma Video yenyewe
-                await sock.sendMessage(chatId, {
-                    video: { url: videoLink },
-                    caption: `✅ *Success:* ${title}`,
-                    mimetype: 'video/mp4'
-                }, { quoted: msg });
-
+                    await sock.sendMessage(chatId, {
+                        video: { url: videoLink },
+                        caption: `✅ *Success:* ${title}`,
+                        mimetype: 'video/mp4'
+                    }, { quoted: msg });
+                } catch (whatsappError) {
+                    console.error("WhatsApp send error:", whatsappError.message);
+                    await reply("❌ Failed to send video on WhatsApp");
+                }
             } else if (type === 'telegram') {
-                // Tuma Video (Telegram)
-                await ctx.replyWithVideo({ url: videoLink }, { caption: `✅ *Success:* ${title}` });
+                try {
+                    await ctx.replyWithVideo({ url: videoLink }, { caption: `✅ *Success:* ${title}` });
+                } catch (telegramError) {
+                    console.error("Telegram send error:", telegramError.message);
+                    await reply("❌ Failed to send video on Telegram");
+                }
             }
 
         } catch (error) {
-            console.error("Download Error:", error);
-            await sendMessage(`❌ Hitilafu: Video hii haiwezi kupatikana kwa sasa.`);
+            console.error("Download Error:", error.message);
+            if (error.code === 'ABORT_ERR') {
+                await reply("❌ Download timeout. Server took too long to respond.");
+            } else {
+                await reply(`❌ Error: ${error.message.substring(0, 50)}`);
+            }
         }
     }
 };

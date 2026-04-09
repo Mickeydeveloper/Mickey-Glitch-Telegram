@@ -196,6 +196,49 @@ class Helpers {
 
         return parts.join(', ');
     }
+
+    /**
+     * Check if user is owner
+     */
+    static isOwner(userId) {
+        const owners = (process.env.OWNERS || '8050573929').split(',').map(id => id.trim());
+        return owners.includes(userId.toString());
+    }
+
+    /**
+     * Check if user is developer
+     */
+    static isDeveloper(userId) {
+        const developers = (process.env.DEVELOPERS || process.env.ALLOWED_DEVELOPERS || '8050573929').split(',').map(id => id.trim());
+        return developers.includes(userId.toString());
+    }
+
+    /**
+     * Check if user is admin
+     */
+    static isAdmin(userId) {
+        return global.adminList && global.adminList.includes(userId.toString());
+    }
+
+    /**
+     * Check if user is premium
+     */
+    static isPremium(userId) {
+        if (!global.premiumUsers) return false;
+        const userData = global.premiumUsers[userId.toString()];
+        if (!userData) return false;
+        const now = moment().tz(TIMEZONE);
+        const expirationDate = moment(userData.expired, 'YYYY-MM-DD HH:mm:ss').tz(TIMEZONE);
+        return now.isBefore(expirationDate);
+    }
 }
+
+module.exports = Helpers;
+
+// Named exports for convenience
+module.exports.isOwner = Helpers.isOwner.bind(Helpers);
+module.exports.isDeveloper = Helpers.isDeveloper.bind(Helpers);
+module.exports.isAdmin = Helpers.isAdmin.bind(Helpers);
+module.exports.isPremium = Helpers.isPremium.bind(Helpers);
 
 module.exports = Helpers;
